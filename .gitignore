@@ -1,0 +1,37 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors / IDEs
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.sublime-workspace
+
+# Secrets / env
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+credentials.json
+secrets.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Node
+node_modules/
+
+# Docker
+.docker/
+
+# Logs
+*.log
