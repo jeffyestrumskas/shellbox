@@ -141,7 +141,6 @@ if [[ -z "${IMAGE_NAME}" ]]; then
 fi
 
 # Build (cached by embedded Dockerfile hash label) unless disabled
-# If you're "cool w/ rebuilding each time", you can skip the label check by setting: existing_hash="" unconditionally.
 if [[ "${NO_BUILD}" -eq 0 ]]; then
   tmpdir="$(mktemp -d)"
   cleanup() { rm -rf "${tmpdir}"; }
@@ -162,8 +161,6 @@ if [[ "${NO_BUILD}" -eq 0 ]]; then
 
   if [[ "${existing_hash}" != "${DOCKERFILE_HASH}" ]]; then
     docker build \
-      --build-arg UID="$(id -u)" \
-      --build-arg GID="$(id -g)" \
       --label "shellbox.dockerfile_sha256=${DOCKERFILE_HASH}" \
       -t "${IMAGE_NAME}" \
       "${tmpdir}"
@@ -254,34 +251,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code
-#RUN curl -fsSL https://claude.ai/install.sh | bash
-#RUN cp /root/.local/bin/claude /usr/local/bin/claude
-#RUN echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-
-
 
 # fd on Ubuntu is typically installed as fdfind; add a convenient symlink
 RUN ln -sf "$(command -v fdfind)" /usr/local/bin/fd || true
 
-# Create a non-root user matching host UID/GID when possible,
-# but reuse an existing group if the GID is already present in the base image.
 ARG USERNAME=dev
-ARG UID=1000
-ARG GID=1000
-
+ARG USER_UID=1003
+ARG USER_GID=1003
 RUN set -eux; \
-    existing_group="$(getent group "${GID}" | cut -d: -f1 || true)"; \
+    existing_group="$(getent group "${USER_GID}" | cut -d: -f1 || true)"; \
     if [ -n "${existing_group}" ]; then \
       group_name="${existing_group}"; \
     else \
-      groupadd -g "${GID}" "${USERNAME}"; \
+      groupadd -g "${USER_GID}" "${USERNAME}"; \
       group_name="${USERNAME}"; \
     fi; \
-    useradd -m -u "${UID}" -g "${group_name}" -s /bin/bash "${USERNAME}"; \
+    useradd -m -u "${USER_UID}" -g "${group_name}" -s /bin/bash "${USERNAME}"; \
     echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USERNAME}"; \
     chmod 0440 "/etc/sudoers.d/${USERNAME}"; \
     mkdir -p /work; \
-    chown -R "${UID}:${GID}" /work || true
+    chown -R "${USER_UID}:${USER_GID}" /work || true
 
 WORKDIR /work
 USER dev
@@ -292,4 +281,3 @@ RUN printf "%s\n" \
   >> ~/.bashrc
 
 CMD ["bash", "-l"]
-
