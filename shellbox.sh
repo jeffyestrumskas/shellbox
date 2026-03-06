@@ -15,6 +15,10 @@ ENV_VARS=()
 PORTS=()
 NETWORKS=()
 
+# Grab host UID/GID once
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
+
 usage() {
   cat <<'EOF'
 Usage: ./shellbox.sh [options] [-- command...]
@@ -24,6 +28,7 @@ Single-file dev sandbox. The Dockerfile is appended at the end of this script an
 - Container is removed on exit (--rm) and auto-named by Docker (unless --container-name is provided).
 - Pip cache does NOT persist (PIP_NO_CACHE_DIR=1).
 - Images are tagged per profile (shellbox-dev:<profile>).
+- The container user is created with YOUR host UID/GID so file permissions just work.
 
 Options:
   -n, --profile NAME                           Use a per-project image tag (shellbox-dev:NAME)
@@ -140,7 +145,7 @@ if [[ -z "${IMAGE_NAME}" ]]; then
   IMAGE_NAME="${IMAGE_REPO}:${PROFILE}"
 fi
 
-# Build (cached by embedded Dockerfile hash label) unless disabled
+# Build (cached by embedded Dockerfile hash + UID/GID) unless disabled
 if [[ "${NO_BUILD}" -eq 0 ]]; then
   tmpdir="$(mktemp -d)"
   cleanup() { rm -rf "${tmpdir}"; }
@@ -153,15 +158,19 @@ if [[ "${NO_BUILD}" -eq 0 ]]; then
   fi
 
   DOCKERFILE_HASH="$(sha256_file "${tmpdir}/Dockerfile")"
+  # Include UID/GID in the cache key so a different user triggers a rebuild
+  CACHE_KEY="${DOCKERFILE_HASH}:${HOST_UID}:${HOST_GID}"
 
   existing_hash="$(
     docker image inspect "${IMAGE_NAME}" \
       --format '{{ index .Config.Labels "shellbox.dockerfile_sha256" }}' 2>/dev/null || true
   )"
 
-  if [[ "${existing_hash}" != "${DOCKERFILE_HASH}" ]]; then
+  if [[ "${existing_hash}" != "${CACHE_KEY}" ]]; then
     docker build \
-      --label "shellbox.dockerfile_sha256=${DOCKERFILE_HASH}" \
+      --build-arg HOST_UID="${HOST_UID}" \
+      --build-arg HOST_GID="${HOST_GID}" \
+      --label "shellbox.dockerfile_sha256=${CACHE_KEY}" \
       -t "${IMAGE_NAME}" \
       "${tmpdir}"
   fi
@@ -171,6 +180,7 @@ PWD_ABS="$(pwd)"
 
 DOCKER_ARGS=(
   run --rm -it
+  --user "${HOST_UID}:${HOST_GID}"
   -w "${WORKDIR}"
   -v "${PWD_ABS}:${WORKDIR}"
   -e "TERM=${TERM:-xterm-256color}"
@@ -255,22 +265,30 @@ RUN npm install -g @anthropic-ai/claude-code
 # fd on Ubuntu is typically installed as fdfind; add a convenient symlink
 RUN ln -sf "$(command -v fdfind)" /usr/local/bin/fd || true
 
+# Create container user with the host caller's UID/GID
+ARG HOST_UID
+ARG HOST_GID
 ARG USERNAME=dev
-ARG USER_UID=1003
-ARG USER_GID=1003
 RUN set -eux; \
-    existing_group="$(getent group "${USER_GID}" | cut -d: -f1 || true)"; \
+    # Handle GID: reuse existing group or create one \
+    existing_group="$(getent group "${HOST_GID}" | cut -d: -f1 || true)"; \
     if [ -n "${existing_group}" ]; then \
       group_name="${existing_group}"; \
     else \
-      groupadd -g "${USER_GID}" "${USERNAME}"; \
+      groupadd -g "${HOST_GID}" "${USERNAME}"; \
       group_name="${USERNAME}"; \
     fi; \
-    useradd -m -u "${USER_UID}" -g "${group_name}" -s /bin/bash "${USERNAME}"; \
+    # Handle UID: if already taken, hijack that user instead of creating a new one \
+    existing_user="$(getent passwd "${HOST_UID}" | cut -d: -f1 || true)"; \
+    if [ -n "${existing_user}" ]; then \
+      usermod -l "${USERNAME}" -d "/home/${USERNAME}" -m -g "${group_name}" -s /bin/bash "${existing_user}"; \
+    else \
+      useradd -m -u "${HOST_UID}" -g "${group_name}" -s /bin/bash "${USERNAME}"; \
+    fi; \
     echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USERNAME}"; \
     chmod 0440 "/etc/sudoers.d/${USERNAME}"; \
     mkdir -p /work; \
-    chown -R "${USER_UID}:${USER_GID}" /work || true
+    chown -R "${HOST_UID}:${HOST_GID}" /work || true
 
 WORKDIR /work
 USER dev
