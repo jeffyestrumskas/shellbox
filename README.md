@@ -2,12 +2,13 @@
 
 A tiny "dev sandbox" wrapper that drops you into a Dockerized shell with your current working directory mounted inside the container.
 
-Currently built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — the Dockerfile is embedded in the script itself (single file, no extras).
+Currently built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) -the Dockerfile is embedded in the script itself (single file, no extras).
 
-- Run from any directory — your project files are mounted at `/work`
+- Run from any directory -your project files are mounted at `/home/dev/work`
 - Container is ephemeral (`--rm`) and removed when you exit
 - Images are tagged per “profile” so you can reuse a built environment across projects
-- Comes with Claude Code CLI, Python 3, Node.js, and common dev tools pre-installed
+- Comes with Claude Code CLI (installed via official `curl` method), Python 3, and common dev tools pre-installed
+- Host Claude config (`~/.claude/`, `~/.claude.json`) is copied into the container on startup; project-level `.claude/` is mounted automatically
 - `ANTHROPIC_API_KEY` is forwarded into the container automatically
 - Lightweight sandboxing: `--cap-drop ALL` and `no-new-privileges`
 
@@ -34,7 +35,7 @@ From any project directory, run:
 shellbox.sh
 ```
 
-This builds a Docker image (if needed), mounts the current directory to `/work` inside the container, and drops you into an interactive bash shell. The container is removed automatically when you exit.
+This builds a Docker image (if needed), mounts the current directory to `/home/dev/work` inside the container, and drops you into an interactive bash shell. The container is removed automatically when you exit.
 
 ### Environment
 
@@ -76,6 +77,7 @@ shellbox.sh -p 8000:8000 -- python3 -m http.server 8000
 | `-N, --network NETWORK` | Connect to a Docker network (repeatable) |
 | `--container-name NAME` | Set an explicit container name |
 | `--image IMAGE` | Use a custom image name (overrides `--profile`) |
+| `--rebuild` | Force a full rebuild from scratch (`docker build --no-cache`) |
 | `--no-build` | Skip the build step (assume the image already exists) |
 | `-h, --help` | Show help |
 

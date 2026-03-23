@@ -4,11 +4,12 @@ set -euo pipefail
 # Defaults
 IMAGE_REPO="shellbox-dev"
 PROFILE="default"                 # controls image tag: shellbox-dev:<PROFILE>
-WORKDIR="/work"
+WORKDIR="/home/dev/work"
 
 IMAGE_NAME=""                     # set after arg parsing
 CONTAINER_NAME=""                 # ONLY set if user passes --container-name
 NO_BUILD=0
+REBUILD=0
 
 EXTRA_MOUNTS=()
 ENV_VARS=()
@@ -24,7 +25,7 @@ usage() {
 Usage: ./shellbox.sh [options] [-- command...]
 
 Single-file dev sandbox. The Dockerfile is appended at the end of this script and extracted at build time.
-- Mounts the current directory to /work and starts in /work.
+- Mounts the current directory to /home/dev/work and starts there.
 - Container is removed on exit (--rm) and auto-named by Docker (unless --container-name is provided).
 - Pip cache does NOT persist (PIP_NO_CACHE_DIR=1).
 - Images are tagged per profile (shellbox-dev:<profile>).
@@ -38,6 +39,7 @@ Options:
   -N, --network NETWORK                        Connect to Docker network (repeatable)
   --container-name NAME                        Set an explicit container name (otherwise Docker auto-names)
   --image IMAGE                                Full image name override (e.g. myrepo:tag). Overrides --profile.
+  --rebuild                                     Force a full rebuild from scratch (docker build --no-cache)
   --no-build                                   Don't build (assume image exists)
   -h, --help                                   Show help
 
@@ -121,6 +123,10 @@ while [[ $# -gt 0 ]]; do
       IMAGE_NAME="$2"
       shift 2
       ;;
+    --rebuild)
+      REBUILD=1
+      shift
+      ;;
     --no-build)
       NO_BUILD=1
       shift
@@ -139,25 +145,38 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Catch conflicting flags
+if [[ "${NO_BUILD}" -eq 1 && "${REBUILD}" -eq 1 ]]; then
+  echo "Error: --no-build and --rebuild are mutually exclusive" >&2
+  exit 2
+fi
+
 # Compute image name default after args:
 # - If --image not provided, use IMAGE_REPO:PROFILE
 if [[ -z "${IMAGE_NAME}" ]]; then
   IMAGE_NAME="${IMAGE_REPO}:${PROFILE}"
 fi
 
+# Cleanup handler for temp files (runs on EXIT now that we don't exec)
+TMPDIR_BUILD=""
+CLAUDE_CONFIG_TAR=""
+cleanup() {
+  [[ -n "${TMPDIR_BUILD}" ]] && rm -rf "${TMPDIR_BUILD}"
+  [[ -n "${CLAUDE_CONFIG_TAR}" && -f "${CLAUDE_CONFIG_TAR}" ]] && rm -f "${CLAUDE_CONFIG_TAR}"
+}
+trap cleanup EXIT
+
 # Build (cached by embedded Dockerfile hash + UID/GID) unless disabled
 if [[ "${NO_BUILD}" -eq 0 ]]; then
-  tmpdir="$(mktemp -d)"
-  cleanup() { rm -rf "${tmpdir}"; }
-  trap cleanup EXIT
+  TMPDIR_BUILD="$(mktemp -d)"
 
-  extract_dockerfile > "${tmpdir}/Dockerfile"
-  if [[ ! -s "${tmpdir}/Dockerfile" ]]; then
+  extract_dockerfile > "${TMPDIR_BUILD}/Dockerfile"
+  if [[ ! -s "${TMPDIR_BUILD}/Dockerfile" ]]; then
     echo "Failed to extract embedded Dockerfile (marker missing?)" >&2
     exit 2
   fi
 
-  DOCKERFILE_HASH="$(sha256_file "${tmpdir}/Dockerfile")"
+  DOCKERFILE_HASH="$(sha256_file "${TMPDIR_BUILD}/Dockerfile")"
   # Include UID/GID in the cache key so a different user triggers a rebuild
   CACHE_KEY="${DOCKERFILE_HASH}:${HOST_UID}:${HOST_GID}"
 
@@ -166,17 +185,27 @@ if [[ "${NO_BUILD}" -eq 0 ]]; then
       --format '{{ index .Config.Labels "shellbox.dockerfile_sha256" }}' 2>/dev/null || true
   )"
 
-  if [[ "${existing_hash}" != "${CACHE_KEY}" ]]; then
+  if [[ "${REBUILD}" -eq 1 ]] || [[ "${existing_hash}" != "${CACHE_KEY}" ]]; then
     docker build \
+      $( (( REBUILD )) && echo "--no-cache" ) \
       --build-arg HOST_UID="${HOST_UID}" \
       --build-arg HOST_GID="${HOST_GID}" \
       --label "shellbox.dockerfile_sha256=${CACHE_KEY}" \
       -t "${IMAGE_NAME}" \
-      "${tmpdir}"
+      "${TMPDIR_BUILD}"
   fi
 fi
 
 PWD_ABS="$(pwd)"
+
+# Prepare host Claude config for copy into container
+if [[ -d "${HOME}/.claude" || -f "${HOME}/.claude.json" ]]; then
+  CLAUDE_CONFIG_TAR="$(mktemp "/tmp/claude-config-XXXXXXXX")"
+  _tar_items=()
+  [[ -d "${HOME}/.claude" ]] && _tar_items+=(".claude")
+  [[ -f "${HOME}/.claude.json" ]] && _tar_items+=(".claude.json")
+  tar -cf "${CLAUDE_CONFIG_TAR}" -C "${HOME}" "${_tar_items[@]}" 2>/dev/null || CLAUDE_CONFIG_TAR=""
+fi
 
 DOCKER_ARGS=(
   run --rm -it
@@ -186,11 +215,18 @@ DOCKER_ARGS=(
   -e "TERM=${TERM:-xterm-256color}"
   -e "PIP_NO_CACHE_DIR=1"
   -e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}"
+  -e "SHELLBOX_HOST_HOME=${HOME}"
+  -e "SHELLBOX_HOST_PWD=${PWD_ABS}"
 
   # Light sandboxing (remove --cap-drop ALL if it breaks something you need)
   --cap-drop ALL
   --security-opt no-new-privileges:true
 )
+
+# Mount host Claude config tarball (entrypoint unpacks it to $HOME)
+if [[ -n "${CLAUDE_CONFIG_TAR}" && -f "${CLAUDE_CONFIG_TAR}" ]]; then
+  DOCKER_ARGS+=( -v "${CLAUDE_CONFIG_TAR}:/tmp/.claude-config.tar:ro" )
+fi
 
 # Only set a container name if explicitly requested; otherwise Docker auto-generates a unique name.
 if [[ -n "${CONTAINER_NAME}" ]]; then
@@ -236,14 +272,15 @@ if (( ${#NETWORKS[@]} )); then
 fi
 
 # Run bash shell, or run provided command
+# No exec — EXIT trap must fire to clean up temp files.
 if [[ $# -gt 0 ]]; then
-  exec docker "${DOCKER_ARGS[@]}" "${IMAGE_NAME}" bash -lc "$*"
+  docker "${DOCKER_ARGS[@]}" "${IMAGE_NAME}" bash -lc '"$@"' _ "$@"
 else
-  exec docker "${DOCKER_ARGS[@]}" "${IMAGE_NAME}"
+  docker "${DOCKER_ARGS[@]}" "${IMAGE_NAME}"
 fi
 
-# IMPORTANT: stop shell parsing before the embedded Dockerfile
-exit 0
+# Stop shell from parsing the embedded Dockerfile below
+exit $?
 __SHELLBOX_DOCKERFILE__
 FROM ubuntu:24.04
 
@@ -256,11 +293,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential pkg-config \
     ripgrep fd-find \
     sudo \
-    nodejs npm \
   && rm -rf /var/lib/apt/lists/*
-
-# Install Claude Code CLI
-RUN npm install -g @anthropic-ai/claude-code
 
 # fd on Ubuntu is typically installed as fdfind; add a convenient symlink
 RUN ln -sf "$(command -v fdfind)" /usr/local/bin/fd || true
@@ -287,15 +320,46 @@ RUN set -eux; \
     fi; \
     echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USERNAME}"; \
     chmod 0440 "/etc/sudoers.d/${USERNAME}"; \
-    mkdir -p /work; \
-    chown -R "${HOST_UID}:${HOST_GID}" /work || true
+    mkdir -p /home/dev/work; \
+    chown -R "${HOST_UID}:${HOST_GID}" /home/dev/work || true
 
-WORKDIR /work
+# Entrypoint: copies host Claude config into container on startup, prints summary
+RUN printf '%s\n' \
+  '#!/bin/bash' \
+  'if [ -f /tmp/.claude-config.tar ]; then' \
+  '  tar xf /tmp/.claude-config.tar -C "$HOME" 2>/dev/null || true' \
+  'fi' \
+  'h="${SHELLBOX_HOST_HOME:-~}"' \
+  'w="${SHELLBOX_HOST_PWD:-.}"' \
+  'printf "\033[1;36m[shellbox]\033[0m Claude config:\n"' \
+  'if [ -d "$HOME/.claude" ]; then' \
+  '  printf "  %s/.claude/     -> %s/.claude/      (copied)\n" "$h" "$HOME"' \
+  'else' \
+  '  printf "  %s/.claude/     -- not found on host\n" "$h"' \
+  'fi' \
+  'if [ -f "$HOME/.claude.json" ]; then' \
+  '  printf "  %s/.claude.json -> %s/.claude.json  (copied)\n" "$h" "$HOME"' \
+  'else' \
+  '  printf "  %s/.claude.json -- not found on host\n" "$h"' \
+  'fi' \
+  'if [ -d ".claude" ]; then' \
+  '  printf "  %s/.claude/     -> %s/.claude/      (mounted)\n" "$w" "$(pwd)"' \
+  'else' \
+  '  printf "  %s/.claude/     -- not found in project\n" "$w"' \
+  'fi' \
+  'exec "$@"' \
+  > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
+
+WORKDIR /home/dev/work
 USER dev
+
+# Install Claude Code CLI (official method)
+RUN curl -fsSL https://claude.ai/install.sh | bash
 
 RUN printf "%s\n" \
   'export PS1="\[\e[1;32m\](shellbox)\[\e[0m\] \u@\h:\w\$ "' \
   'export PIP_DISABLE_PIP_VERSION_CHECK=1' \
   >> ~/.bashrc
 
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["bash", "-l"]
