@@ -6,15 +6,51 @@ IMAGE_REPO="shellbox-dev"
 PROFILE="default"                 # controls image tag: shellbox-dev:<PROFILE>
 WORKDIR="/home/dev/work"
 
+# Pre-accept Claude Code's interactive sandbox dialogs (1=on, 0=off).
+# Applied to the container's config at startup by the entrypoint helper, so
+# toggling these takes effect on the next run with NO rebuild needed.
+SHELLBOX_TRUST_WORKDIR=1              # skip the "trust this folder?" dialog
+SHELLBOX_ACCEPT_BYPASS_PERMISSIONS=1  # skip the "Bypass Permissions mode" warning
+
 IMAGE_NAME=""                     # set after arg parsing
 CONTAINER_NAME=""                 # ONLY set if user passes --container-name
 NO_BUILD=0
 REBUILD=0
 
 EXTRA_MOUNTS=()
-ENV_VARS=()
 PORTS=()
 NETWORKS=()
+
+# Preset env vars always injected into the container.
+# These go FIRST so that any user-supplied `-e KEY=VALUE` (appended later)
+# overrides them — Docker honors the last `-e` for a given key.
+DEFAULT_ENV_VARS=(
+  # Generic opt-outs honored by many tools
+  "DO_NOT_TRACK=1"
+  "DISABLE_TELEMETRY=1"
+
+  # Claude Code (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is the umbrella switch)
+  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
+  "DISABLE_ERROR_REPORTING=1"
+  "DISABLE_BUG_COMMAND=1"
+  "DISABLE_NON_ESSENTIAL_MODEL_CALLS=1"
+
+  # Node / JS ecosystem
+  "NEXT_TELEMETRY_DISABLED=1"
+  "NUXT_TELEMETRY_DISABLED=1"
+  "GATSBY_TELEMETRY_DISABLED=1"
+  "ASTRO_TELEMETRY_DISABLED=1"
+  "TURBO_TELEMETRY_DISABLED=1"
+  "STORYBOOK_DISABLE_TELEMETRY=1"
+  "SAM_CLI_TELEMETRY=0"
+
+  # Python / data tooling
+  "SCARF_ANALYTICS=false"           # Scarf-instrumented pkgs (e.g. some PyPI/npm)
+
+)
+
+# User `-e/--env` flags are appended to this during arg parsing.
+ENV_VARS=("${DEFAULT_ENV_VARS[@]}")
 
 # Grab host UID/GID once
 HOST_UID="$(id -u)"
@@ -160,9 +196,11 @@ fi
 # Cleanup handler for temp files (runs on EXIT now that we don't exec)
 TMPDIR_BUILD=""
 CLAUDE_CONFIG_TAR=""
+CLAUDE_JSON_DIR=""
 cleanup() {
   [[ -n "${TMPDIR_BUILD}" ]] && rm -rf "${TMPDIR_BUILD}"
   [[ -n "${CLAUDE_CONFIG_TAR}" && -f "${CLAUDE_CONFIG_TAR}" ]] && rm -f "${CLAUDE_CONFIG_TAR}"
+  [[ -n "${CLAUDE_JSON_DIR}" && -d "${CLAUDE_JSON_DIR}" ]] && rm -rf "${CLAUDE_JSON_DIR}"
 }
 trap cleanup EXIT
 
@@ -198,13 +236,61 @@ fi
 
 PWD_ABS="$(pwd)"
 
-# Prepare host Claude config for copy into container
-if [[ -d "${HOME}/.claude" || -f "${HOME}/.claude.json" ]]; then
+# Prepare host Claude config for copy into container (MVP / surgical).
+# Copy ONLY settings, auth, and user customizations — NOT history, caches,
+# projects, sessions, todos, statsig, or the (8MB+) plugins/marketplace dir.
+CLAUDE_CONFIG_INCLUDES=(
+  ".claude/settings.json"        # global settings
+  ".claude/.credentials.json"    # auth token (avoids re-login in the box)
+  ".claude/CLAUDE.md"            # global memory / instructions
+  ".claude/agents"              # custom subagents
+  ".claude/commands"            # custom slash commands
+  ".claude/skills"              # custom skills
+  ".claude/output-styles"       # custom output styles
+)
+
+_tar_items=()
+for _item in "${CLAUDE_CONFIG_INCLUDES[@]}"; do
+  [[ -e "${HOME}/${_item}" ]] && _tar_items+=("${_item}")
+done
+
+# Strip ~/.claude.json down to onboarding/auth keys so Claude doesn't re-run
+# onboarding on every start, while dropping per-project history and the pile of
+# cached telemetry (statsig/growthbook/tips/...). Needs python3 on the host; if
+# it's missing we just skip .claude.json (auth still works via .credentials.json).
+if [[ -f "${HOME}/.claude.json" ]] && command -v python3 >/dev/null 2>&1; then
+  CLAUDE_JSON_DIR="$(mktemp -d)"
+  if ! python3 - "${HOME}/.claude.json" "${CLAUDE_JSON_DIR}/.claude.json" <<'PY'
+import json, sys
+src, dst = sys.argv[1], sys.argv[2]
+KEEP = {
+    "hasCompletedOnboarding", "lastOnboardingVersion",
+    "userID", "oauthAccount", "customApiKeyResponses",
+    "installMethod", "autoUpdates", "firstStartTime",
+    "lastReleaseNotesSeen",
+}
+try:
+    d = json.load(open(src))
+except Exception:
+    d = {}
+# Note: the "trust this folder" entry is injected at container startup by the
+# entrypoint (see Dockerfile below), so it works even if the host lacks python3.
+json.dump({k: d[k] for k in KEEP if k in d}, open(dst, "w"), indent=2)
+PY
+  then
+    CLAUDE_JSON_DIR=""   # stripping failed; skip it
+  fi
+fi
+
+# Build the tarball: allowlisted .claude items (rooted at $HOME) plus the
+# stripped .claude.json (rooted at its staging dir). Repeated -C is honored by
+# both GNU and BSD tar. Entrypoint unpacks this into $HOME on startup.
+if (( ${#_tar_items[@]} )) || [[ -n "${CLAUDE_JSON_DIR}" ]]; then
   CLAUDE_CONFIG_TAR="$(mktemp "/tmp/claude-config-XXXXXXXX")"
-  _tar_items=()
-  [[ -d "${HOME}/.claude" ]] && _tar_items+=(".claude")
-  [[ -f "${HOME}/.claude.json" ]] && _tar_items+=(".claude.json")
-  tar -cf "${CLAUDE_CONFIG_TAR}" -C "${HOME}" "${_tar_items[@]}" 2>/dev/null || CLAUDE_CONFIG_TAR=""
+  _tar_args=( -cf "${CLAUDE_CONFIG_TAR}" )
+  (( ${#_tar_items[@]} ))    && _tar_args+=( -C "${HOME}" "${_tar_items[@]}" )
+  [[ -n "${CLAUDE_JSON_DIR}" ]] && _tar_args+=( -C "${CLAUDE_JSON_DIR}" ".claude.json" )
+  tar "${_tar_args[@]}" 2>/dev/null || CLAUDE_CONFIG_TAR=""
 fi
 
 DOCKER_ARGS=(
@@ -215,8 +301,8 @@ DOCKER_ARGS=(
   -e "TERM=${TERM:-xterm-256color}"
   -e "PIP_NO_CACHE_DIR=1"
   -e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}"
-  -e "SHELLBOX_HOST_HOME=${HOME}"
-  -e "SHELLBOX_HOST_PWD=${PWD_ABS}"
+  -e "SHELLBOX_TRUST_WORKDIR=${SHELLBOX_TRUST_WORKDIR}"
+  -e "SHELLBOX_ACCEPT_BYPASS_PERMISSIONS=${SHELLBOX_ACCEPT_BYPASS_PERMISSIONS}"
 
   # Light sandboxing (remove --cap-drop ALL if it breaks something you need)
   --cap-drop ALL
@@ -291,7 +377,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     vim tmux git openssh-client \
     python3 python3-pip python3-venv \
     build-essential pkg-config \
-    ripgrep fd-find \
+    ripgrep fd-find nodejs \
     sudo \
   && rm -rf /var/lib/apt/lists/*
 
@@ -323,29 +409,67 @@ RUN set -eux; \
     mkdir -p /home/dev/work; \
     chown -R "${HOST_UID}:${HOST_GID}" /home/dev/work || true
 
+# Helper: pre-accept Claude Code's interactive sandbox dialogs, each gated by an
+# env var passed in at runtime (so toggling needs no rebuild). Runs in-container
+# (python3 is always present here), so it works even if the host lacked python3.
+#   SHELLBOX_TRUST_WORKDIR=1            -> hasTrustDialogAccepted in ~/.claude.json
+#   SHELLBOX_ACCEPT_BYPASS_PERMISSIONS=1 -> skipDangerousModePermissionPrompt in
+#                                          ~/.claude/settings.json (documented key)
+RUN printf '%s\n' \
+  'import json, os, sys' \
+  'def truthy(v): return str(v).strip().lower() in ("1", "true", "yes", "on")' \
+  'def load(p):' \
+  '    try:' \
+  '        with open(p) as f: return json.load(f)' \
+  '    except Exception:' \
+  '        return {}' \
+  'def save(p, d):' \
+  '    os.makedirs(os.path.dirname(p), exist_ok=True)' \
+  '    with open(p, "w") as f: json.dump(d, f, indent=2)' \
+  'home = os.path.expanduser("~")' \
+  'workdir = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()' \
+  'if truthy(os.environ.get("SHELLBOX_TRUST_WORKDIR")):' \
+  '    p = os.path.join(home, ".claude.json")' \
+  '    d = load(p)' \
+  '    proj = d.setdefault("projects", {}).setdefault(workdir, {})' \
+  '    proj["hasTrustDialogAccepted"] = True' \
+  '    proj.setdefault("projectOnboardingSeenCount", 1)' \
+  '    save(p, d)' \
+  'if truthy(os.environ.get("SHELLBOX_ACCEPT_BYPASS_PERMISSIONS")):' \
+  '    p = os.path.join(home, ".claude", "settings.json")' \
+  '    s = load(p)' \
+  '    s["skipDangerousModePermissionPrompt"] = True' \
+  '    save(p, s)' \
+  > /usr/local/bin/ensure-claude-config.py
+
 # Entrypoint: copies host Claude config into container on startup, prints summary
 RUN printf '%s\n' \
   '#!/bin/bash' \
   'if [ -f /tmp/.claude-config.tar ]; then' \
   '  tar xf /tmp/.claude-config.tar -C "$HOME" 2>/dev/null || true' \
   'fi' \
-  'h="${SHELLBOX_HOST_HOME:-~}"' \
-  'w="${SHELLBOX_HOST_PWD:-.}"' \
+  'python3 /usr/local/bin/ensure-claude-config.py "$(pwd)" 2>/dev/null || true' \
   'printf "\033[1;36m[shellbox]\033[0m Claude config:\n"' \
   'if [ -d "$HOME/.claude" ]; then' \
-  '  printf "  %s/.claude/     -> %s/.claude/      (copied)\n" "$h" "$HOME"' \
+  '  printf "  %s/.claude/      (copied from host)\n" "$HOME"' \
   'else' \
-  '  printf "  %s/.claude/     -- not found on host\n" "$h"' \
+  '  printf "  %s/.claude/      -- not found on host\n" "$HOME"' \
   'fi' \
   'if [ -f "$HOME/.claude.json" ]; then' \
-  '  printf "  %s/.claude.json -> %s/.claude.json  (copied)\n" "$h" "$HOME"' \
+  '  printf "  %s/.claude.json  (copied from host)\n" "$HOME"' \
   'else' \
-  '  printf "  %s/.claude.json -- not found on host\n" "$h"' \
+  '  printf "  %s/.claude.json  -- not found on host\n" "$HOME"' \
   'fi' \
-  'if [ -d ".claude" ]; then' \
-  '  printf "  %s/.claude/     -> %s/.claude/      (mounted)\n" "$w" "$(pwd)"' \
+  'if [ -d "$(pwd)/.claude" ]; then' \
+  '  printf "  %s/.claude/      (mounted from project)\n" "$(pwd)"' \
   'else' \
-  '  printf "  %s/.claude/     -- not found in project\n" "$w"' \
+  '  printf "  %s/.claude/      -- not found in project\n" "$(pwd)"' \
+  'fi' \
+  'acc=""' \
+  'case "${SHELLBOX_TRUST_WORKDIR:-}" in 1|true|yes|on) acc="folder-trust" ;; esac' \
+  'case "${SHELLBOX_ACCEPT_BYPASS_PERMISSIONS:-}" in 1|true|yes|on) acc="${acc:+$acc, }bypass-permissions" ;; esac' \
+  'if [ -n "$acc" ]; then' \
+  '  printf "\033[1;36m[shellbox]\033[0m Auto-accepted dialogs: %s\n" "$acc"' \
   'fi' \
   'exec "$@"' \
   > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh

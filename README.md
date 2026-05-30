@@ -8,8 +8,9 @@ Currently built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code
 - Container is ephemeral (`--rm`) and removed when you exit
 - Images are tagged per “profile” so you can reuse a built environment across projects
 - Comes with Claude Code CLI (installed via official `curl` method), Python 3, and common dev tools pre-installed
-- Host Claude config (`~/.claude/`, `~/.claude.json`) is copied into the container on startup; project-level `.claude/` is mounted automatically
-- `ANTHROPIC_API_KEY` is forwarded into the container automatically
+- Surgical Claude config copy: settings, auth, and customizations only — no history/caches/plugins; project `.claude/` is mounted
+- `ANTHROPIC_API_KEY` forwarded; telemetry opt-out vars preset (overridable)
+- Optional toggles to pre-accept Claude Code's folder-trust / bypass-permissions dialogs
 - Lightweight sandboxing: `--cap-drop ALL` and `no-new-privileges`
 
 ---
@@ -46,6 +47,18 @@ The following are set inside the container automatically:
 | `ANTHROPIC_API_KEY` | Forwarded from host (required for Claude Code) |
 | `PIP_NO_CACHE_DIR=1` | Disables pip cache inside the container |
 | `TERM` | Inherited from host (`xterm-256color` default) |
+| Telemetry opt-outs | `DO_NOT_TRACK`, `DISABLE_TELEMETRY`, etc. (see `DEFAULT_ENV_VARS` in the script) |
+
+Presets apply first; `-e KEY=VALUE` overrides them.
+
+### Sandbox dialog auto-accept
+
+Toggles at the top of `shellbox.sh` pre-accept Claude Code's first-run dialogs (`1`/`0`, no rebuild needed):
+
+| Variable | Suppresses |
+|---|---|
+| `SHELLBOX_TRUST_WORKDIR` | "Trust this folder?" |
+| `SHELLBOX_ACCEPT_BYPASS_PERMISSIONS` | "Bypass Permissions mode" warning |
 
 ### Profiles
 

@@ -30,6 +30,9 @@ venv/
 # Node
 node_modules/
 
+# Claude Code (local/personal)
+.claude/
+
 # Docker
 .docker/
 
