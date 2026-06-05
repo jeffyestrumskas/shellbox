@@ -38,3 +38,8 @@ node_modules/
 
 # Logs
 *.log
+
+# boxwall — local firewall rules / state (default lives in ~/.shellbox, but
+# ignore here too in case --rules-dir points into the repo)
+.shellbox/
+boxwall-rules.json

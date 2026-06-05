@@ -16,6 +16,9 @@ IMAGE_NAME=""                     # set after arg parsing
 CONTAINER_NAME=""                 # ONLY set if user passes --container-name
 NO_BUILD=0
 REBUILD=0
+USE_RUNSC=0                       # opt-in: run under gVisor (--runtime=runsc)
+USE_BOXWALL=0                       # opt-in: route egress through the boxwall proxy
+BOXWALL_NAME="shellbox-boxwall"       # boxwall container to attach to (see boxwall.sh)
 
 EXTRA_MOUNTS=()
 PORTS=()
@@ -47,10 +50,20 @@ DEFAULT_ENV_VARS=(
   # Python / data tooling
   "SCARF_ANALYTICS=false"           # Scarf-instrumented pkgs (e.g. some PyPI/npm)
 
+  # Runtime / host-derived (interpolated at definition time)
+  "TERM=${TERM:-xterm-256color}"
+  "PIP_NO_CACHE_DIR=1"
+  "SHELLBOX_TRUST_WORKDIR=${SHELLBOX_TRUST_WORKDIR}"
+  "SHELLBOX_ACCEPT_BYPASS_PERMISSIONS=${SHELLBOX_ACCEPT_BYPASS_PERMISSIONS}"
 )
 
 # User `-e/--env` flags are appended to this during arg parsing.
 ENV_VARS=("${DEFAULT_ENV_VARS[@]}")
+
+# Forward host's Anthropic API key into the sandbox (edit/remove to taste).
+FORWARD_ANTHROPIC_API_KEY=0
+[[ "${FORWARD_ANTHROPIC_API_KEY}" -eq 1 && -n "${ANTHROPIC_API_KEY:-}" ]] && \
+  ENV_VARS+=( "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" )
 
 # Grab host UID/GID once
 HOST_UID="$(id -u)"
@@ -77,6 +90,9 @@ Options:
   --image IMAGE                                Full image name override (e.g. myrepo:tag). Overrides --profile.
   --rebuild                                     Force a full rebuild from scratch (docker build --no-cache)
   --no-build                                   Don't build (assume image exists)
+  --runsc                                       Run under gVisor (--runtime=runsc) if registered; warn + continue if not
+  --boxwall                                       Route all egress through a running boxwall.sh (interactive egress firewall)
+  --boxwall-name NAME                             Boxwall container to attach to (default: shellbox-boxwall; implies --boxwall)
   -h, --help                                   Show help
 
 Examples:
@@ -85,7 +101,7 @@ Examples:
   ./shellbox.sh -n projectA -v .:/pwd
   ./shellbox.sh -p 8000:8000 -- python3 -m http.server 8000
   ./shellbox.sh --container-name mybox   # fixed name (prevents running two with same name)
-  ./shellbox.sh -N sentirail             # join a Docker network (e.g. to reach guard-proxy)
+  ./shellbox.sh -N sentirail             # join a Docker network (e.g. to reach boxwall-proxy)
 EOF
 }
 
@@ -166,6 +182,20 @@ while [[ $# -gt 0 ]]; do
     --no-build)
       NO_BUILD=1
       shift
+      ;;
+    --runsc)
+      USE_RUNSC=1
+      shift
+      ;;
+    --boxwall)
+      USE_BOXWALL=1
+      shift
+      ;;
+    --boxwall-name)
+      [[ $# -ge 2 ]] || { echo "Missing argument for $1" >&2; exit 2; }
+      BOXWALL_NAME="$2"
+      USE_BOXWALL=1
+      shift 2
       ;;
     -h|--help)
       usage
@@ -298,16 +328,45 @@ DOCKER_ARGS=(
   --user "${HOST_UID}:${HOST_GID}"
   -w "${WORKDIR}"
   -v "${PWD_ABS}:${WORKDIR}"
-  -e "TERM=${TERM:-xterm-256color}"
-  -e "PIP_NO_CACHE_DIR=1"
-  -e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}"
-  -e "SHELLBOX_TRUST_WORKDIR=${SHELLBOX_TRUST_WORKDIR}"
-  -e "SHELLBOX_ACCEPT_BYPASS_PERMISSIONS=${SHELLBOX_ACCEPT_BYPASS_PERMISSIONS}"
+
+  # Env vars (incl. TERM, PIP_NO_CACHE_DIR, SHELLBOX_*, and any -e flags) are
+  # added below from the ENV_VARS array. Only genuine run flags live here.
 
   # Light sandboxing (remove --cap-drop ALL if it breaks something you need)
   --cap-drop ALL
   --security-opt no-new-privileges:true
 )
+
+# Opt-in gVisor: only add --runtime=runsc if the daemon actually has it
+# registered; otherwise warn and fall back to the default runtime.
+if [[ "${USE_RUNSC}" -eq 1 ]]; then
+  if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"runsc"'; then
+    DOCKER_ARGS+=( --runtime=runsc )
+  else
+    echo "Warning: --runsc requested but the 'runsc' runtime is not registered with the Docker daemon; continuing without gVisor." >&2
+  fi
+fi
+
+# Opt-in boxwall: share the boxwall container's network namespace so ALL egress is
+# forced through its interactive proxy (see boxwall.sh). Fail-closed: if the boxwall
+# isn't running, refuse to start rather than fall back to unfiltered network.
+if [[ "${USE_BOXWALL}" -eq 1 ]]; then
+  if (( ${#PORTS[@]} )) || (( ${#NETWORKS[@]} )); then
+    echo "Error: --boxwall shares the boxwall's network namespace, so -p/--port and -N/--network can't be used with it (publish ports on the boxwall instead)." >&2
+    exit 2
+  fi
+  if [[ "$(docker inspect -f '{{.State.Running}}' "${BOXWALL_NAME}" 2>/dev/null || true)" != "true" ]]; then
+    echo "Error: --boxwall requested but the boxwall netns holder '${BOXWALL_NAME}' is not running." >&2
+    echo "Start it in another window first:  ./boxwall/boxwall.sh$( [[ "${BOXWALL_NAME}" != "shellbox-boxwall" ]] && echo " --name ${BOXWALL_NAME}" )" >&2
+    exit 2
+  fi
+  # The holder can be up while the interactive proxy/console is down — in that
+  # case egress is fail-closed until you (re)start boxwall.sh. Warn, don't block.
+  if [[ "$(docker inspect -f '{{.State.Running}}' "${BOXWALL_NAME}-ctl" 2>/dev/null || true)" != "true" ]]; then
+    echo "Warning: boxwall console '${BOXWALL_NAME}-ctl' is not running; egress will be blocked until you run ./boxwall/boxwall.sh." >&2
+  fi
+  DOCKER_ARGS+=( --network "container:${BOXWALL_NAME}" )
+fi
 
 # Mount host Claude config tarball (entrypoint unpacks it to $HOME)
 if [[ -n "${CLAUDE_CONFIG_TAR}" && -f "${CLAUDE_CONFIG_TAR}" ]]; then

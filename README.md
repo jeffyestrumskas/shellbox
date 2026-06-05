@@ -8,10 +8,11 @@ Currently built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code
 - Container is ephemeral (`--rm`) and removed when you exit
 - Images are tagged per “profile” so you can reuse a built environment across projects
 - Comes with Claude Code CLI (installed via official `curl` method), Python 3, and common dev tools pre-installed
-- Surgical Claude config copy: settings, auth, and customizations only — no history/caches/plugins; project `.claude/` is mounted
+- Surgical Claude config copy: settings, auth, and customizations only (no history/caches/plugins); project `.claude/` is mounted
 - `ANTHROPIC_API_KEY` forwarded; telemetry opt-out vars preset (overridable)
 - Optional toggles to pre-accept Claude Code's folder-trust / bypass-permissions dialogs
 - Lightweight sandboxing: `--cap-drop ALL` and `no-new-privileges`
+- Optional gVisor isolation (`--runsc`) and an opt-in interactive egress firewall (`--boxwall`, see [boxwall](#boxwall))
 
 ---
 
@@ -92,6 +93,9 @@ shellbox.sh -p 8000:8000 -- python3 -m http.server 8000
 | `--image IMAGE` | Use a custom image name (overrides `--profile`) |
 | `--rebuild` | Force a full rebuild from scratch (`docker build --no-cache`) |
 | `--no-build` | Skip the build step (assume the image already exists) |
+| `--runsc` | Run under gVisor (`--runtime=runsc`) if registered; warn + continue otherwise |
+| `--boxwall` | Route all egress through a running [boxwall](boxwall/README.md) firewall (see below). Incompatible with `-p`/`-N` |
+| `--boxwall-name NAME` | Attach to a named boxwall (default `shellbox-boxwall`; implies `--boxwall`) |
 | `-h, --help` | Show help |
 
 ### Examples
@@ -112,4 +116,20 @@ shellbox.sh -N my-network
 # Fixed container name (prevents duplicate instances)
 shellbox.sh --container-name mybox
 ```
+
+---
+
+## boxwall
+
+`boxwall` is an opt-in, interactive egress firewall for the sandbox: run it in a second window and approve every new outbound connection by hand. Start it, then attach a sandbox with `--boxwall`:
+
+```bash
+# window 1: start the firewall (stays running)
+./boxwall/boxwall.sh
+
+# window 2: start a sandbox that routes all egress through it
+shellbox.sh --boxwall
+```
+
+It lives in its own directory with full docs: see [boxwall/README.md](boxwall/README.md).
 
