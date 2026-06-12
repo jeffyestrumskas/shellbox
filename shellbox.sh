@@ -19,6 +19,13 @@ REBUILD=0
 USE_RUNSC=0                       # opt-in: run under gVisor (--runtime=runsc)
 USE_BOXWALL=0                       # opt-in: route egress through the boxwall proxy
 BOXWALL_NAME="shellbox-boxwall"       # boxwall container to attach to (see boxwall.sh)
+USE_CLAW=0                        # opt-in: "openclaw" mode (see --claw below)
+CLAW_PIDS_LIMIT=4096              # fork-bomb guard applied in --claw mode
+USE_WATCH=0                       # opt-in: record activity via the out-of-box boxwatch
+BOXWATCH_NAME="shellbox-boxwatch"     # boxwatch container to register with (see boxwatch.sh)
+WATCH_DIR="${HOME}/.shellbox/watch"   # where boxwatch reads target registrations
+ALLOW_HOST=0                      # opt-out: --allow-host disables the default host-egress block
+LOCKDOWN_TIMEOUT=150              # entrypoint gate: N * 0.1s before fail-closed refuse (default 15s)
 
 EXTRA_MOUNTS=()
 PORTS=()
@@ -93,6 +100,17 @@ Options:
   --runsc                                       Run under gVisor (--runtime=runsc) if registered; warn + continue if not
   --boxwall                                       Route all egress through a running boxwall.sh (interactive egress firewall)
   --boxwall-name NAME                             Boxwall container to attach to (default: shellbox-boxwall; implies --boxwall)
+  --claw                                          "openclaw" mode: let an autonomous agent install software and run freely
+                                               INSIDE the box (default caps + seccomp, working sudo, PID guard) while it
+                                               still can't escape to the host. Only host effects: network + the bind mount.
+                                               Composes with --boxwall / --runsc for tighter egress / isolation.
+  --watch                                         Record this box's file/network/process activity via a running boxwatch.sh
+                                               (out-of-box eBPF; the box can't see or disable it). Incompatible with --runsc.
+  --watch-name NAME                               Boxwatch container to register with (default: shellbox-boxwatch; implies --watch)
+  --allow-host                                    Disable the default host-egress block (let the box reach host-local
+                                               services such as host.docker.internal). The block is ON by default, so
+                                               a rogue agent can't reach services bound to your host. No effect with
+                                               --boxwall (which already gates all egress).
   -h, --help                                   Show help
 
 Examples:
@@ -102,6 +120,9 @@ Examples:
   ./shellbox.sh -p 8000:8000 -- python3 -m http.server 8000
   ./shellbox.sh --container-name mybox   # fixed name (prevents running two with same name)
   ./shellbox.sh -N sentirail             # join a Docker network (e.g. to reach boxwall-proxy)
+  ./shellbox.sh --claw                   # "openclaw": autonomous Claude that can install software, locked to the box
+  ./shellbox.sh --claw --boxwall         # same, but every outbound connection is gated by the egress firewall
+  ./shellbox.sh --claw --watch           # same, plus tamper-proof recording of all file/network/process activity
 EOF
 }
 
@@ -197,6 +218,24 @@ while [[ $# -gt 0 ]]; do
       USE_BOXWALL=1
       shift 2
       ;;
+    --claw)
+      USE_CLAW=1
+      shift
+      ;;
+    --watch)
+      USE_WATCH=1
+      shift
+      ;;
+    --allow-host)
+      ALLOW_HOST=1
+      shift
+      ;;
+    --watch-name)
+      [[ $# -ge 2 ]] || { echo "Missing argument for $1" >&2; exit 2; }
+      BOXWATCH_NAME="$2"
+      USE_WATCH=1
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -217,20 +256,65 @@ if [[ "${NO_BUILD}" -eq 1 && "${REBUILD}" -eq 1 ]]; then
   exit 2
 fi
 
+# --watch records via host-kernel eBPF, which can't see syscalls a gVisor sandbox
+# makes (they're serviced by the runsc sentry in userspace), so the watcher would
+# go blind. Refuse the combination rather than record nothing.
+if [[ "${USE_WATCH}" -eq 1 && "${USE_RUNSC}" -eq 1 ]]; then
+  echo "Error: --watch (host eBPF) can't observe syscalls under gVisor; --watch and --runsc are mutually exclusive." >&2
+  exit 2
+fi
+
+# Host-egress block (default ON): keep a rogue agent inside the box from reaching
+# services bound to the host (host.docker.internal & the Docker Desktop host range).
+# Implemented by a transient NET_ADMIN helper that injects iptables DROP rules into
+# the box's netns after start; the box keeps --cap-drop ALL so it can't undo them.
+# Disabled when:
+#   --allow-host : the operator explicitly wants host access.
+#   --boxwall    : boxwall already default-denies ALL egress (host included).
+#   --runsc      : gVisor runs its own userspace netstack, so an iptables sidecar in
+#                  the shared netns doesn't reliably apply; point the user at boxwall.
+LOCKDOWN=1
+if [[ "${ALLOW_HOST}" -eq 1 ]]; then
+  LOCKDOWN=0
+elif [[ "${USE_BOXWALL}" -eq 1 ]]; then
+  LOCKDOWN=0
+elif [[ "${USE_RUNSC}" -eq 1 ]]; then
+  echo "Warning: the built-in host-egress block isn't applied under gVisor (--runsc). Use --boxwall to gate host access, or pass --allow-host to silence this." >&2
+  LOCKDOWN=0
+fi
+
 # Compute image name default after args:
 # - If --image not provided, use IMAGE_REPO:PROFILE
 if [[ -z "${IMAGE_NAME}" ]]; then
   IMAGE_NAME="${IMAGE_REPO}:${PROFILE}"
 fi
 
+# --watch needs a deterministic container name so the out-of-box watcher can map
+# this sandbox to its cgroup. Give it one if the user didn't (PID keeps it unique
+# across concurrent watched sandboxes).
+if [[ "${USE_WATCH}" -eq 1 && -z "${CONTAINER_NAME}" ]]; then
+  CONTAINER_NAME="shellbox-watched-$$"
+fi
+
+# The host-egress block helper must address this box by a stable name to join its
+# netns, so give it one if the user didn't (PID keeps it unique across concurrent boxes).
+if [[ "${LOCKDOWN}" -eq 1 && -z "${CONTAINER_NAME}" ]]; then
+  CONTAINER_NAME="shellbox-$$"
+fi
+
 # Cleanup handler for temp files (runs on EXIT now that we don't exec)
 TMPDIR_BUILD=""
 CLAUDE_CONFIG_TAR=""
 CLAUDE_JSON_DIR=""
+WATCH_TARGET_FILE=""
+LOCKDOWN_GATE_DIR=""
 cleanup() {
   [[ -n "${TMPDIR_BUILD}" ]] && rm -rf "${TMPDIR_BUILD}"
   [[ -n "${CLAUDE_CONFIG_TAR}" && -f "${CLAUDE_CONFIG_TAR}" ]] && rm -f "${CLAUDE_CONFIG_TAR}"
   [[ -n "${CLAUDE_JSON_DIR}" && -d "${CLAUDE_JSON_DIR}" ]] && rm -rf "${CLAUDE_JSON_DIR}"
+  # Deregister from the watcher so it stops scoping probes to a dead cgroup.
+  [[ -n "${WATCH_TARGET_FILE}" && -f "${WATCH_TARGET_FILE}" ]] && rm -f "${WATCH_TARGET_FILE}"
+  [[ -n "${LOCKDOWN_GATE_DIR}" && -d "${LOCKDOWN_GATE_DIR}" ]] && rm -rf "${LOCKDOWN_GATE_DIR}"
 }
 trap cleanup EXIT
 
@@ -331,11 +415,35 @@ DOCKER_ARGS=(
 
   # Env vars (incl. TERM, PIP_NO_CACHE_DIR, SHELLBOX_*, and any -e flags) are
   # added below from the ENV_VARS array. Only genuine run flags live here.
-
-  # Light sandboxing (remove --cap-drop ALL if it breaks something you need)
-  --cap-drop ALL
-  --security-opt no-new-privileges:true
 )
+
+# Sandbox hardening posture.
+#
+# Strict (default): drop ALL Linux capabilities and forbid privilege escalation.
+# Ideal for "just let Claude read and run my code" — but it also blocks system
+# package installs, because sudo/apt can no longer elevate.
+#
+# --claw ("openclaw"): loosen the *in-container* restrictions just enough that an
+# autonomous agent can install software and do real work, WITHOUT handing it any
+# new reach over the host. We keep Docker's DEFAULT capability set and DEFAULT
+# seccomp profile — both designed to prevent container->host escape — and leave
+# no-new-privileges off so `sudo apt-get install ...` works. A --pids-limit is
+# added as a fork-bomb guard. The container's only persistent effect on the host
+# stays exactly what it was: outbound network + writes to the bind-mounted
+# workdir. We still run as your host UID, so files the agent creates in the
+# workdir remain host-owned (sudo grants in-container root only when needed).
+if [[ "${USE_CLAW}" -eq 1 ]]; then
+  # No --cap-drop and no no-new-privileges here, on purpose: that's what lets the
+  # agent install software. Host isolation is preserved by NOT adding any of the
+  # dangerous escapes (--privileged, docker socket, host mounts, --pid=host, ...).
+  DOCKER_ARGS+=( --pids-limit "${CLAW_PIDS_LIMIT}" )
+else
+  # Light sandboxing (remove --cap-drop ALL if it breaks something you need)
+  DOCKER_ARGS+=(
+    --cap-drop ALL
+    --security-opt no-new-privileges:true
+  )
+fi
 
 # Opt-in gVisor: only add --runtime=runsc if the daemon actually has it
 # registered; otherwise warn and fall back to the default runtime.
@@ -366,6 +474,44 @@ if [[ "${USE_BOXWALL}" -eq 1 ]]; then
     echo "Warning: boxwall console '${BOXWALL_NAME}-ctl' is not running; egress will be blocked until you run ./boxwall/boxwall.sh." >&2
   fi
   DOCKER_ARGS+=( --network "container:${BOXWALL_NAME}" )
+fi
+
+# Opt-in watch: record this box's activity via the out-of-box boxwatch. Fail-closed:
+# if the watcher isn't running, refuse to start rather than run an unwatched box (the
+# whole point is that a rogue agent can't run un-recorded). Nothing is added to
+# DOCKER_ARGS — the watcher observes from outside; we only register this box's name so
+# a background helper can hand the watcher its container id once it exists.
+if [[ "${USE_WATCH}" -eq 1 ]]; then
+  if [[ "$(docker inspect -f '{{.State.Running}}' "${BOXWATCH_NAME}" 2>/dev/null || true)" != "true" ]]; then
+    echo "Error: --watch requested but the watcher '${BOXWATCH_NAME}' is not running." >&2
+    echo "Start it in another window first:  ./boxwatch/boxwatch.sh$( [[ "${BOXWATCH_NAME}" != "shellbox-boxwatch" ]] && echo " --name ${BOXWATCH_NAME}" )" >&2
+    exit 2
+  fi
+  # The watcher's integrity rests on the box NOT being able to write to WATCH_DIR
+  # (where target registrations live). If WATCH_DIR is inside the bind-mounted
+  # workdir, a rogue box could forge/redirect targets — refuse rather than pretend.
+  _watch_abs="$(abs_host_path "${WATCH_DIR}")"
+  case "${_watch_abs%/}/" in
+    "${PWD_ABS%/}/"*)
+      echo "Error: --watch dir (${_watch_abs}) is inside the bind-mounted workdir (${PWD_ABS}); the box could tamper with its own watcher." >&2
+      echo "Point boxwatch at a dir outside this tree (boxwatch.sh --watch-dir ...) or run shellbox from elsewhere." >&2
+      exit 2 ;;
+  esac
+fi
+
+# Host-egress block: stage a host-owned "gate" dir, mounted read-only into the box.
+# The entrypoint blocks until a background helper (below) confirms the DROP rules are
+# in place by writing <gate>/ready; if it never appears, the entrypoint refuses to
+# start (fail-closed). The box can't forge the sentinel: it's mounted ro AND nothing
+# in the box is running yet while the entrypoint waits.
+if [[ "${LOCKDOWN}" -eq 1 ]]; then
+  LOCKDOWN_GATE_DIR="$(mktemp -d)"
+  chmod 700 "${LOCKDOWN_GATE_DIR}"
+  DOCKER_ARGS+=(
+    -v "${LOCKDOWN_GATE_DIR}:/run/shellbox-gate:ro"
+    -e "SHELLBOX_LOCKDOWN_GATE=/run/shellbox-gate/ready"
+    -e "SHELLBOX_LOCKDOWN_TIMEOUT=${LOCKDOWN_TIMEOUT}"
+  )
 fi
 
 # Mount host Claude config tarball (entrypoint unpacks it to $HOME)
@@ -416,8 +562,101 @@ if (( ${#NETWORKS[@]} )); then
   done
 fi
 
+# Claw posture banner: make the relaxed-inside / locked-to-host trade explicit.
+if [[ "${USE_CLAW}" -eq 1 ]]; then
+  printf '\033[1;33m[shellbox:claw]\033[0m openclaw mode — the agent can install software and run freely INSIDE this box.\n' >&2
+  printf '  host isolation kept: no privileged, no docker socket, no host mounts beyond the workdir; default caps + seccomp.\n' >&2
+  printf '  only host effects: outbound network%s and writes to the bind mount (%s).\n' \
+    "$( [[ "${USE_BOXWALL}" -eq 1 ]] && echo " (gated by boxwall)" )" "${PWD_ABS}" >&2
+  printf '  pids-limit=%s%s\n' "${CLAW_PIDS_LIMIT}" "$( [[ "${USE_RUNSC}" -eq 1 ]] && echo ", gVisor on" )" >&2
+fi
+
+# Watch registrar: the container doesn't exist until `docker run` below, so spawn
+# a background helper that waits for it to appear, then records its id where the
+# out-of-box watcher will pick it up and scope its eBPF probes to this cgroup. The
+# EXIT trap removes the registration when the box stops.
+if [[ "${USE_WATCH}" -eq 1 ]]; then
+  mkdir -p "${WATCH_DIR}/targets"
+  WATCH_TARGET_FILE="${WATCH_DIR}/targets/${CONTAINER_NAME}.json"
+  (
+    for _ in $(seq 1 100); do
+      cid="$(docker inspect -f '{{.Id}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
+      if [[ -n "${cid}" ]]; then
+        printf '{"name":"%s","id":"%s"}\n' "${CONTAINER_NAME}" "${cid}" > "${WATCH_TARGET_FILE}"
+        break
+      fi
+      sleep 0.2
+    done
+  ) &
+
+  printf '\033[1;36m[shellbox:watch]\033[0m activity capture ON via out-of-box watcher %s.\n' "${BOXWATCH_NAME}" >&2
+  printf '  file / network / process events -> %s (this box cannot see or disable it).\n' "${WATCH_DIR}" >&2
+fi
+
+# Host-egress block helper: the box's netns doesn't exist until `docker run` below,
+# so spawn a background helper that waits for the box to be running, joins its netns
+# with NET_ADMIN, and installs DROP rules for the host-local ranges — then signals the
+# entrypoint (which is blocking) by writing <gate>/ready. The box itself keeps
+# --cap-drop ALL, so it can never see this helper or remove the rules it leaves behind.
+# Fail-closed: if the helper can't apply the rules, no sentinel is written and the
+# entrypoint refuses to start the shell.
+if [[ "${LOCKDOWN}" -eq 1 ]]; then
+  # Runs INSIDE the box's network namespace (via --network container:), as root with
+  # NET_ADMIN. Strategy, ordered safest-first:
+  #   1. Drop the resolved Docker Desktop host aliases (host.docker.internal=.254,
+  #      gateway.docker.internal=.1) — but NEVER the default gateway, which is our route
+  #      to the internet (and on plain Linux the host itself IS the gateway). This alone
+  #      blocks every host path we demonstrated, and can't touch DNS.
+  #   2. Defense-in-depth: only if the resolver sits in the Docker Desktop host range,
+  #      ACCEPT it explicitly and then drop the rest of 192.168.65.0/24. Gated on the
+  #      carve-out so the blanket can never blackhole the box's own DNS.
+  #   3. Drop link-local (incl. cloud metadata 169.254.169.254).
+  # Pure bash + getent/grep/cut (no iproute2); harmless on hosts without that range.
+  LOCKDOWN_SCRIPT='set -eu
+gwip=""
+while read -r _if dest gw _rest; do
+  [ "$dest" = "00000000" ] || continue
+  gwip=$(printf "%d.%d.%d.%d" "0x${gw:6:2}" "0x${gw:4:2}" "0x${gw:2:2}" "0x${gw:0:2}")
+  break
+done < /proc/net/route
+for name in host.docker.internal gateway.docker.internal; do
+  hip=$(getent hosts "$name" 2>/dev/null | head -n1 | cut -d" " -f1 || true)
+  [ -z "$hip" ] && continue
+  [ "$hip" = "$gwip" ] && continue
+  iptables -A OUTPUT -d "$hip" -j DROP
+done
+dns=$(grep -m1 "^nameserver" /etc/resolv.conf 2>/dev/null | cut -d" " -f2 || true)
+case "$dns" in
+  192.168.65.*)
+    iptables -I OUTPUT 1 -d "$dns" -j ACCEPT
+    iptables -A OUTPUT -d 192.168.65.0/24 -j DROP
+    ;;
+esac
+iptables -A OUTPUT -d 169.254.0.0/16 -j DROP'
+  (
+    for _ in $(seq 1 100); do
+      if [[ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER_NAME}" 2>/dev/null || true)" == "true" ]]; then
+        if docker run --rm \
+             --cap-add NET_ADMIN --cap-add NET_RAW --user 0:0 \
+             --network "container:${CONTAINER_NAME}" \
+             --entrypoint /bin/bash \
+             "${IMAGE_NAME}" -c "${LOCKDOWN_SCRIPT}" >/dev/null 2>&1; then
+          : > "${LOCKDOWN_GATE_DIR}/ready"
+        fi
+        break
+      fi
+      sleep 0.1
+    done
+  ) &
+
+  printf '\033[1;36m[shellbox:lock]\033[0m host-egress block ON — the box cannot reach host-local services (host.docker.internal et al.).\n' >&2
+  printf '  DNS, gateway, and general internet stay up. Opt out with --allow-host; for gVisor/Linux hosts use --boxwall.\n' >&2
+fi
+
 # Run bash shell, or run provided command
 # No exec — EXIT trap must fire to clean up temp files.
+# Note: --claw never auto-launches claude; you always land in a shell (or run the
+# command you passed) and start the agent yourself.
 if [[ $# -gt 0 ]]; then
   docker "${DOCKER_ARGS[@]}" "${IMAGE_NAME}" bash -lc '"$@"' _ "$@"
 else
@@ -437,7 +676,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv \
     build-essential pkg-config \
     ripgrep fd-find nodejs \
-    sudo \
+    sudo iptables \
   && rm -rf /var/lib/apt/lists/*
 
 # fd on Ubuntu is typically installed as fdfind; add a convenient symlink
@@ -530,6 +769,22 @@ RUN printf '%s\n' \
   'if [ -n "$acc" ]; then' \
   '  printf "\033[1;36m[shellbox]\033[0m Auto-accepted dialogs: %s\n" "$acc"' \
   'fi' \
+  '# Host-egress block gate: wait until the out-of-box helper has installed the DROP' \
+  '# rules (it writes <gate>/ready). Fail-closed: refuse to start if they never land,' \
+  '# so the box never runs with host-local services reachable.' \
+  'if [ -n "${SHELLBOX_LOCKDOWN_GATE:-}" ]; then' \
+  '  _tries=0; _max="${SHELLBOX_LOCKDOWN_TIMEOUT:-150}"' \
+  '  while [ ! -f "${SHELLBOX_LOCKDOWN_GATE}" ]; do' \
+  '    _tries=$((_tries+1))' \
+  '    if [ "${_tries}" -gt "${_max}" ]; then' \
+  '      printf "\033[1;31m[shellbox]\033[0m FATAL: host-egress block was not applied in time; refusing to start (fail-closed).\n" >&2' \
+  '      printf "  Rebuild the image (--rebuild) or, to allow host access on purpose, rerun with --allow-host.\n" >&2' \
+  '      exit 1' \
+  '    fi' \
+  '    sleep 0.1' \
+  '  done' \
+  '  printf "\033[1;36m[shellbox]\033[0m host-egress block active: host-local services are unreachable from this box.\n"' \
+  'fi' \
   'exec "$@"' \
   > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
@@ -542,6 +797,7 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 RUN printf "%s\n" \
   'export PS1="\[\e[1;32m\](shellbox)\[\e[0m\] \u@\h:\w\$ "' \
   'export PIP_DISABLE_PIP_VERSION_CHECK=1' \
+  'export PATH="$HOME/.local/bin:$PATH"  # where the claude installer lands' \
   >> ~/.bashrc
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

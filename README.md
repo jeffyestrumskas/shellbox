@@ -12,7 +12,10 @@ Currently built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code
 - `ANTHROPIC_API_KEY` forwarded; telemetry opt-out vars preset (overridable)
 - Optional toggles to pre-accept Claude Code's folder-trust / bypass-permissions dialogs
 - Lightweight sandboxing: `--cap-drop ALL` and `no-new-privileges`
+- Host-egress block **on by default**: the box can't reach host-local services (`host.docker.internal` and the Docker Desktop host range) while DNS/gateway/internet stay up — opt out with `--allow-host` (see [host-egress block](#host-egress-block))
 - Optional gVisor isolation (`--runsc`) and an opt-in interactive egress firewall (`--boxwall`, see [boxwall](#boxwall))
+- `--claw` ("openclaw") mode: let an autonomous agent install software and run freely *inside* the box while staying locked to the host (see [claw](#claw-openclaw-mode))
+- `--watch`: tamper-proof, out-of-box recording of the box's file/network/process activity (`--watch`, see [boxwatch](#boxwatch))
 
 ---
 
@@ -96,6 +99,10 @@ shellbox.sh -p 8000:8000 -- python3 -m http.server 8000
 | `--runsc` | Run under gVisor (`--runtime=runsc`) if registered; warn + continue otherwise |
 | `--boxwall` | Route all egress through a running [boxwall](boxwall/README.md) firewall (see below). Incompatible with `-p`/`-N` |
 | `--boxwall-name NAME` | Attach to a named boxwall (default `shellbox-boxwall`; implies `--boxwall`) |
+| `--claw` | "openclaw" mode: let an autonomous agent install software and run freely inside the box, locked to the host (see [claw](#claw-openclaw-mode)) |
+| `--watch` | Record file/network/process activity via a running [boxwatch](boxwatch/README.md) (out-of-box, tamper-proof). Incompatible with `--runsc` |
+| `--watch-name NAME` | Register with a named boxwatch (default `shellbox-boxwatch`; implies `--watch`) |
+| `--allow-host` | Disable the default [host-egress block](#host-egress-block) and let the box reach host-local services. No effect with `--boxwall` |
 | `-h, --help` | Show help |
 
 ### Examples
@@ -119,6 +126,31 @@ shellbox.sh --container-name mybox
 
 ---
 
+## Host-egress block
+
+On by default: blocks the box from reaching `host.docker.internal` / the host range (DNS + internet stay up), so a rogue agent can't hit your localhost services. Fail-closed; the box can't undo it. Disable with `--allow-host`. For full default-deny (LAN IP, IPv6), use `--boxwall`.
+
+---
+
+## claw (openclaw mode)
+
+`--claw` lets an autonomous agent install software and run freely *inside* the container, while it gains **no new reach over the host** — the only things crossing the boundary stay outbound network and writes to the bind-mounted workdir.
+
+```bash
+shellbox.sh --claw              # claw-capable shell; start the agent yourself
+shellbox.sh --claw --boxwall    # same, but gate every outbound connection by hand
+```
+
+The default sandbox blocks installs (`--cap-drop ALL` + `no-new-privileges` stop `sudo`). `--claw`:
+
+- swaps in Docker's default caps + seccomp (still block container→host escape) so `sudo`/`apt` work
+- adds a `--pids-limit` fork-bomb guard
+- keeps your host UID and no dangerous escapes (`--privileged`, Docker socket, host mounts, `--pid=host`) — in-container root ≠ host root; installs vanish with the container
+
+Combine `--claw --boxwall --runsc` for the tightest posture.
+
+---
+
 ## boxwall
 
 `boxwall` is an opt-in, interactive egress firewall for the sandbox: run it in a second window and approve every new outbound connection by hand. Start it, then attach a sandbox with `--boxwall`:
@@ -132,4 +164,20 @@ shellbox.sh --boxwall
 ```
 
 It lives in its own directory with full docs: see [boxwall/README.md](boxwall/README.md).
+
+---
+
+## boxwatch
+
+`boxwatch` is an opt-in, out-of-box activity recorder: a privileged container that runs outside the sandbox and uses eBPF to record the box's file, network, and process activity to a host log the box can't reach — so a rogue agent can't disable its own watching. Start it, then attach a sandbox with `--watch`:
+
+```bash
+# window 1: start the watcher (stays running)
+./boxwatch/boxwatch.sh
+
+# window 2: start a sandbox whose activity is recorded
+shellbox.sh --watch
+```
+
+`--watch` refuses to start unless the watcher is up, and is incompatible with `--runsc` (gVisor hides syscalls from the host kernel). It lives in its own directory with full docs: see [boxwatch/README.md](boxwatch/README.md).
 
