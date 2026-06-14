@@ -7,7 +7,7 @@ set -euo pipefail
 #   ./shellbox.sh --boxwall   # attach a sandbox from another
 #   ./boxwall.sh --down       # tear it down
 #
-# Two containers: a persistent netns holder (default shellbox-boxwall) owning the
+# Two containers: a persistent netns holder (named by the required --name) owning the
 # namespace + egress (the sandbox joins THIS), and a foreground proxy/console
 # (-ctl) sharing the netns to gate traffic. Rerunning boxwall.sh keeps the holder
 # up; while the console is down egress is fail-closed. The proxy peeks the TLS
@@ -16,9 +16,9 @@ set -euo pipefail
 
 IMAGE_REPO="shellbox-boxwall"
 PROFILE="default"
-BOXWALL_NAME="shellbox-boxwall"        # name shellbox.sh --boxwall looks for
+BOXWALL_NAME=""                        # required via --name; the namespace shellbox.sh --boxwall attaches to
 PROXY_PORT=12345
-RULES_DIR="${HOME}/.shellbox"
+RULES_DIR="${PWD}/.shellbox"
 IMAGE_NAME=""
 NO_BUILD=0
 REBUILD=0
@@ -32,10 +32,11 @@ Interactive egress firewall for shellbox sandboxes. Run in its own window, then
 start a sandbox with `./shellbox.sh --boxwall` in another.
 
 Options:
-  --name NAME          Boxwall container name (default: shellbox-boxwall). Must match
-                       shellbox.sh's --boxwall-name if you override it.
+  --name NAME          Boxwall namespace (REQUIRED). Names the firewall containers and
+                       scopes its rules file. Attach a sandbox with the same name via
+                       shellbox.sh --boxwall NAME (or --boxwall-name NAME).
   --port PORT          Internal proxy port (default: 12345)
-  --rules-dir DIR      Where to persist allow-forever rules (default: ~/.shellbox)
+  --rules-dir DIR      Where to persist allow-forever rules (default: ./.shellbox)
   --image IMAGE        Full image name override (e.g. myrepo:tag)
   --rebuild            Force a full rebuild (docker build --no-cache)
   --no-build           Don't build (assume image exists)
@@ -68,6 +69,14 @@ done
 
 if [[ "${NO_BUILD}" -eq 1 && "${REBUILD}" -eq 1 ]]; then
   echo "Error: --no-build and --rebuild are mutually exclusive" >&2
+  exit 2
+fi
+
+# A namespace is mandatory: it names the containers, scopes the rules file, and is
+# what `shellbox.sh --boxwall NAME` attaches to. Refuse to guess a default.
+if [[ -z "${BOXWALL_NAME}" ]]; then
+  echo "Error: --name NAME is required (the boxwall namespace)." >&2
+  echo "  e.g. ./boxwall.sh --name proj-a   then   ./shellbox.sh --boxwall proj-a" >&2
   exit 2
 fi
 
@@ -114,6 +123,27 @@ fi
 
 mkdir -p "${RULES_DIR}"
 
+# Decide how to persist allow-forever rules. Prefer a host bind mount so the
+# rules file is inspectable at ${RULES_DIR}/boxwall-rules.json. But Docker
+# Desktop refuses to bind-mount host paths that aren't in its File Sharing list
+# ("path ... is not shared from the host and is not known to Docker"), which
+# would kill the console before it ever seals the proxy. Probe the mount with a
+# throwaway container; if Docker rejects it, fall back to a managed named volume
+# so the firewall still runs (rules persist across restarts; they're just not a
+# host-visible file).
+# Scope the rules file to the boxwall namespace so several boxwalls can share one
+# ${RULES_DIR} without clobbering each other's allow-forever lists.
+RULES_BASENAME="boxwall-rules-${BOXWALL_NAME}.json"
+RULES_VOLUME="${BOXWALL_NAME}-rules"
+RULES_MOUNT="${RULES_DIR}:/rules"
+if ! docker run --rm --entrypoint true -v "${RULES_DIR}:/rules" "${IMAGE_NAME}" >/dev/null 2>&1; then
+  RULES_MOUNT="${RULES_VOLUME}:/rules"
+  echo "[boxwall] WARN: cannot bind-mount '${RULES_DIR}' (Docker is not sharing that host path);" >&2
+  echo "[boxwall]       persisting rules in the Docker named volume '${RULES_VOLUME}' instead." >&2
+  echo "[boxwall]       For a host-visible rules file, add '${RULES_DIR}' (or your home dir) under" >&2
+  echo "[boxwall]       Docker Desktop -> Settings -> Resources -> File Sharing, or pass --rules-dir a shared path." >&2
+fi
+
 # 1) Ensure the netns holder is up. The sandbox joins IT, not the console, so
 #    restarting the console never drops the sandbox's network.
 if [[ "$(docker inspect -f '{{.State.Running}}' "${NETNS_NAME}" 2>/dev/null || true)" != "true" ]]; then
@@ -123,11 +153,33 @@ if [[ "$(docker inspect -f '{{.State.Running}}' "${NETNS_NAME}" 2>/dev/null || t
   # `set -e` kills PID 1 (and the --rm container) on a failed seal instead of
   # sleeping open; the console rebuilds the full ruleset later. NET_ADMIN is
   # per-process, so a joining sandbox doesn't inherit it (stays --cap-drop ALL).
+  # route_localnet=1 is REQUIRED for the design to work: REDIRECT rewrites the
+  # sandbox's packets to 127.0.0.1, and without this the kernel won't reroute a
+  # loopback destination from a non-loopback source (the sandbox's real IP) onto lo,
+  # so they keep egressing eth0 and hit the catch-all DROP instead of the proxy.
+  # This is consulted PER INTERFACE on the reroute path: conf.all=1 alone is NOT
+  # enough -- conf.eth0 must be 1 too (verified empirically: with all=1 but eth0=0
+  # the redirected packets still drop). It can only be set at creation: /proc/sys/net
+  # is a read-only mount in the holder, so neither `docker exec` (even --privileged)
+  # nor a netns-joining helper can write it afterward. Namespaced sysctl; the host is
+  # untouched.
+  # Docker Engine 28+ no longer accepts interface-specific sysctls for a NAMED iface
+  # (net.ipv4.conf.eth0.*) via --sysctl -- it errors "must be supplied using driver
+  # option 'com.docker.network.endpoint.sysctls'". The per-iface value is instead
+  # passed as a bridge endpoint driver-opt, with the IFNAME placeholder (the real
+  # iface name isn't known at create time; Docker substitutes it, == eth0 on the
+  # default bridge). The non-iface 'all' and loopback 'lo' settings still ride
+  # --sysctl. Joining the default bridge explicitly via --network name=bridge is
+  # required to attach the driver-opt; it's the same network the container used
+  # implicitly before.
   docker run -d --rm \
     --name "${NETNS_NAME}" \
     --cap-drop ALL \
     --cap-add NET_ADMIN \
     --security-opt no-new-privileges:true \
+    --sysctl net.ipv4.conf.all.route_localnet=1 \
+    --sysctl net.ipv4.conf.lo.route_localnet=1 \
+    --network "name=bridge,driver-opt=com.docker.network.endpoint.sysctls=net.ipv4.conf.IFNAME.route_localnet=1" \
     --entrypoint sh \
     "${IMAGE_NAME}" -c '
       set -e
@@ -159,6 +211,18 @@ if [[ "$(docker inspect -f '{{.State.Running}}' "${NETNS_NAME}" 2>/dev/null || t
   fi
 fi
 
+# A holder left running from before route_localnet was added to the --sysctl list
+# above would still have it off (re-running boxwall.sh does NOT recreate a live
+# holder), and it can't be fixed in place (/proc/sys/net is read-only in the holder).
+# Detect that case and force a recreate so the new sysctls actually apply.
+if docker exec --privileged "${NETNS_NAME}" \
+     cat /proc/sys/net/ipv4/conf/eth0/route_localnet 2>/dev/null | grep -q '^0'; then
+  echo "[boxwall] holder '${NETNS_NAME}' predates the eth0 route_localnet fix; recreating it." >&2
+  docker rm -f "${CTL_NAME}" "${NETNS_NAME}" >/dev/null 2>&1 || true
+  echo "[boxwall] re-run this command to start the holder with the corrected sysctls." >&2
+  exit 1
+fi
+
 # 2) Don't let two consoles fight over the same netns / proxy port.
 if [[ "$(docker inspect -f '{{.State.Running}}' "${CTL_NAME}" 2>/dev/null || true)" == "true" ]]; then
   echo "Error: a boxwall console '${CTL_NAME}' is already running. Stop it first." >&2
@@ -166,7 +230,7 @@ if [[ "$(docker inspect -f '{{.State.Running}}' "${CTL_NAME}" 2>/dev/null || tru
 fi
 docker rm -f "${CTL_NAME}" >/dev/null 2>&1 || true
 
-echo "[boxwall] console attaching to '${NETNS_NAME}'. Start a sandbox with: ./shellbox.sh --boxwall$( [[ "${BOXWALL_NAME}" != "shellbox-boxwall" ]] && echo " --boxwall-name ${BOXWALL_NAME}" )"
+echo "[boxwall] console attaching to '${NETNS_NAME}'. Start a sandbox with: ./shellbox.sh --boxwall ${BOXWALL_NAME}"
 
 # 3) Foreground proxy/console: shares the holder's netns, manages its iptables,
 #    runs the prompt. Exit leaves the holder intact. NET_ADMIN only (iptables +
@@ -178,8 +242,8 @@ docker run --rm -it \
   --cap-add NET_ADMIN \
   --security-opt no-new-privileges:true \
   -e BOXWALL_PROXY_PORT="${PROXY_PORT}" \
-  -e BOXWALL_RULES_FILE="/rules/boxwall-rules.json" \
-  -v "${RULES_DIR}:/rules" \
+  -e BOXWALL_RULES_FILE="/rules/${RULES_BASENAME}" \
+  -v "${RULES_MOUNT}" \
   "${IMAGE_NAME}"
 
 # Stop shell from parsing the embedded build files below
@@ -346,6 +410,13 @@ def setup_iptables():
         print("[boxwall] WARN: no IPv4 nameserver in resolv.conf; external DNS will be "
               "blocked (loopback resolver still works).", file=sys.stderr)
     failures = []
+    # route_localnet (so the kernel will route/deliver the REDIRECT-to-127.0.0.1
+    # packets at all rather than treating 127/8 as martian) is set on the holder at
+    # creation via --sysctl/endpoint driver-opt, incl. per-interface eth0. It can't
+    # be set from here: this console shares the holder's netns, where /proc/sys/net
+    # is a read-only mount. NOTE: route_localnet alone is not sufficient on every
+    # kernel -- it does not reliably move the packet's oif to lo -- so the FILTER
+    # chain below also accepts by destination (127.0.0.0/8), not just '-o lo'.
     # Fail CLOSED while (re)building: OUTPUT policy DROP *before* the flush, else
     # the flush..catch-all window runs default-ACCEPT on an empty chain. Policy
     # persists in the holder's netns, so "console down" stays closed.
@@ -368,7 +439,18 @@ def setup_iptables():
     # FILTER: allow loopback (REDIRECT DNATs to 127.0.0.1) + the proxy's marked
     # sockets, DROP the rest. The catch-all blocks ICMP/SCTP/GRE/QUIC/HTTP3 exfil
     # the TCP-only REDIRECT wouldn't cover.
+    #
+    # The REDIRECT'd packet's dst is rewritten to 127.0.0.1, but on some Docker/
+    # kernel combos (observed on Docker Desktop's LinuxKit kernel even with
+    # route_localnet=1 set on all/lo/eth0) the post-DNAT reroute does NOT move the
+    # packet's output interface to lo, so it reaches this chain with oif=eth0,
+    # misses '-o lo ACCEPT', and dies on the catch-all DROP -- the proxy never
+    # sees the connection. Accept by DESTINATION instead: 127/8 can never egress a
+    # real interface, so this is local-only and exactly as safe as the -o lo rule,
+    # but it doesn't depend on the reroute happening. Keep BOTH (lo by-iface covers
+    # genuine loopback traffic; 127/8 by-dest covers the redirected flows).
     _run_rule("iptables -A OUTPUT -o lo -j ACCEPT", True, failures)
+    _run_rule("iptables -A OUTPUT -d 127.0.0.0/8 -j ACCEPT", True, failures)
     _run_rule(f"iptables -A OUTPUT -m mark --mark {MARK} -j ACCEPT", True, failures)
     _run_rule("iptables -A OUTPUT -j DROP", True, failures)
 
@@ -547,6 +629,12 @@ async def name_matches_ip(host, ip):
     # Does the claimed name resolve (via our pinned resolver) to the IP the
     # sandbox is dialing? If not, the SNI/Host is spoofed and can't match a rule.
     # Cache + re-resolve on miss to cope with CDN/round-robin.
+    # A literal-IP SNI/Host (e.g. `curl 1.1.1.1`, where Host: is the IP itself)
+    # can't be DNS-resolved -- the lookup just fails and prints a spurious
+    # "does not resolve" WARN. If the claimed name IS the dialed IP, it trivially
+    # matches; no lookup needed.
+    if host == ip:
+        return True
     ips = _resolve_cache.get(host, set())
     if ip in ips:
         return True
@@ -692,9 +780,19 @@ async def serve_dns(listener, data, src, origdst):
     # One redirected DNS datagram: prompt once for the resolver, relay over a
     # marked socket, hand the reply back. conntrack rewrites the reply source to
     # resolver:53 so the sandbox's stub sees a normal answer.
-    if origdst is None:
+    #
+    # Recover which pinned resolver this datagram targeted. On some kernels the
+    # REDIRECT'd UDP arrives without a usable conntrack original-dst, so
+    # IP_ORIGDSTADDR comes back as the interceptor's OWN 127.0.0.1:DNS_PORT. We
+    # only ever REDIRECT the pinned resolver(s), so when the recovered dst is
+    # loopback/missing, fall back to the first pinned resolver rather than relaying
+    # to ourselves (which just loops: "dns relay failed 127.0.0.1:<DNS_PORT>").
+    if origdst is not None and not origdst[0].startswith("127."):
+        rip, rport = origdst
+    elif RESOLVER_V4:
+        rip, rport = RESOLVER_V4[0], 53
+    else:
         return
-    rip, rport = origdst
     stats["seen"] += 1
     entry = _note_access(rip, rport)
     if not await _dns_allowed(rip, rport):

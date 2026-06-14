@@ -21,7 +21,7 @@ Currently built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code
 
 ## Requirements
 
-- Docker Desktop / Docker Engine (23.0+ recommended for multiple `--network` flags)
+- Docker Desktop / Docker Engine (23.0+ recommended for multiple `--network` flags; **28+ for `--boxwall`**)
 - `ANTHROPIC_API_KEY` set in your host environment
 
 ---
@@ -97,8 +97,8 @@ shellbox.sh -p 8000:8000 -- python3 -m http.server 8000
 | `--rebuild` | Force a full rebuild from scratch (`docker build --no-cache`) |
 | `--no-build` | Skip the build step (assume the image already exists) |
 | `--runsc` | Run under gVisor (`--runtime=runsc`) if registered; warn + continue otherwise |
-| `--boxwall` | Route all egress through a running [boxwall](boxwall/README.md) firewall (see below). Incompatible with `-p`/`-N` |
-| `--boxwall-name NAME` | Attach to a named boxwall (default `shellbox-boxwall`; implies `--boxwall`) |
+| `--boxwall NAME` | Route all egress through the running [boxwall](boxwall/README.md) firewall named NAME (see below). NAME is required. Incompatible with `-p`/`-N` |
+| `--boxwall-name NAME` | Same as `--boxwall NAME` (explicit form; implies `--boxwall`) |
 | `--claw` | "openclaw" mode: let an autonomous agent install software and run freely inside the box, locked to the host (see [claw](#claw-openclaw-mode)) |
 | `--watch` | Record file/network/process activity via a running [boxwatch](boxwatch/README.md) (out-of-box, tamper-proof). Incompatible with `--runsc` |
 | `--watch-name NAME` | Register with a named boxwatch (default `shellbox-boxwatch`; implies `--watch`) |
@@ -137,8 +137,8 @@ On by default: blocks the box from reaching `host.docker.internal` / the host ra
 `--claw` lets an autonomous agent install software and run freely *inside* the container, while it gains **no new reach over the host** — the only things crossing the boundary stay outbound network and writes to the bind-mounted workdir.
 
 ```bash
-shellbox.sh --claw              # claw-capable shell; start the agent yourself
-shellbox.sh --claw --boxwall    # same, but gate every outbound connection by hand
+shellbox.sh --claw                   # claw-capable shell; start the agent yourself
+shellbox.sh --claw --boxwall proj-a  # same, but gate every outbound connection by hand
 ```
 
 The default sandbox blocks installs (`--cap-drop ALL` + `no-new-privileges` stop `sudo`). `--claw`:
@@ -147,20 +147,20 @@ The default sandbox blocks installs (`--cap-drop ALL` + `no-new-privileges` stop
 - adds a `--pids-limit` fork-bomb guard
 - keeps your host UID and no dangerous escapes (`--privileged`, Docker socket, host mounts, `--pid=host`) — in-container root ≠ host root; installs vanish with the container
 
-Combine `--claw --boxwall --runsc` for the tightest posture.
+Combine `--claw --boxwall proj-a --runsc` for the tightest posture.
 
 ---
 
 ## boxwall
 
-`boxwall` is an opt-in, interactive egress firewall for the sandbox: run it in a second window and approve every new outbound connection by hand. Start it, then attach a sandbox with `--boxwall`:
+`boxwall` is an opt-in, interactive egress firewall for the sandbox: run it in a second window and approve every new outbound connection by hand. Start it with a required namespace, then attach a sandbox with the same name:
 
 ```bash
-# window 1: start the firewall (stays running)
-./boxwall/boxwall.sh
+# window 1: start the firewall (stays running); --name is required
+./boxwall/boxwall.sh --name proj-a
 
 # window 2: start a sandbox that routes all egress through it
-shellbox.sh --boxwall
+shellbox.sh --boxwall proj-a
 ```
 
 It lives in its own directory with full docs: see [boxwall/README.md](boxwall/README.md).

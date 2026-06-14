@@ -18,7 +18,7 @@ NO_BUILD=0
 REBUILD=0
 USE_RUNSC=0                       # opt-in: run under gVisor (--runtime=runsc)
 USE_BOXWALL=0                       # opt-in: route egress through the boxwall proxy
-BOXWALL_NAME="shellbox-boxwall"       # boxwall container to attach to (see boxwall.sh)
+BOXWALL_NAME=""                       # boxwall namespace to attach to; required with --boxwall (see boxwall.sh)
 USE_CLAW=0                        # opt-in: "openclaw" mode (see --claw below)
 CLAW_PIDS_LIMIT=4096              # fork-bomb guard applied in --claw mode
 USE_WATCH=0                       # opt-in: record activity via the out-of-box boxwatch
@@ -98,8 +98,9 @@ Options:
   --rebuild                                     Force a full rebuild from scratch (docker build --no-cache)
   --no-build                                   Don't build (assume image exists)
   --runsc                                       Run under gVisor (--runtime=runsc) if registered; warn + continue if not
-  --boxwall                                       Route all egress through a running boxwall.sh (interactive egress firewall)
-  --boxwall-name NAME                             Boxwall container to attach to (default: shellbox-boxwall; implies --boxwall)
+  --boxwall NAME                                  Route all egress through the running boxwall.sh named NAME (interactive egress
+                                               firewall). NAME is required and must match the boxwall's --name.
+  --boxwall-name NAME                             Same as --boxwall NAME (explicit form; implies --boxwall)
   --claw                                          "openclaw" mode: let an autonomous agent install software and run freely
                                                INSIDE the box (default caps + seccomp, working sudo, PID guard) while it
                                                still can't escape to the host. Only host effects: network + the bind mount.
@@ -121,7 +122,8 @@ Examples:
   ./shellbox.sh --container-name mybox   # fixed name (prevents running two with same name)
   ./shellbox.sh -N sentirail             # join a Docker network (e.g. to reach boxwall-proxy)
   ./shellbox.sh --claw                   # "openclaw": autonomous Claude that can install software, locked to the box
-  ./shellbox.sh --claw --boxwall         # same, but every outbound connection is gated by the egress firewall
+  ./shellbox.sh --claw --boxwall proj-a  # same, but every outbound connection is gated by the egress firewall
+  ./shellbox.sh --boxwall proj-a         # attach to the boxwall named proj-a (its own rule set)
   ./shellbox.sh --claw --watch           # same, plus tamper-proof recording of all file/network/process activity
 EOF
 }
@@ -210,6 +212,15 @@ while [[ $# -gt 0 ]]; do
       ;;
     --boxwall)
       USE_BOXWALL=1
+      # Optional inline name: `--boxwall NAME` is shorthand for `--boxwall-name NAME`.
+      # Consume the next token only when it's a bare value (not a flag, not the `--`
+      # command separator), so `--boxwall` alone, `--boxwall --watch`, and
+      # `--boxwall -- cmd` all still work. To run a command under the default
+      # boxwall, separate it with `--` (e.g. `--boxwall -- ls -la`).
+      if [[ $# -ge 2 && "$2" != "--" && "$2" != -* ]]; then
+        BOXWALL_NAME="$2"
+        shift
+      fi
       shift
       ;;
     --boxwall-name)
@@ -253,6 +264,14 @@ done
 # Catch conflicting flags
 if [[ "${NO_BUILD}" -eq 1 && "${REBUILD}" -eq 1 ]]; then
   echo "Error: --no-build and --rebuild are mutually exclusive" >&2
+  exit 2
+fi
+
+# --boxwall requires a namespace: it must name which boxwall to attach to. There
+# is no default, so an unnamed --boxwall is an error rather than a silent guess.
+if [[ "${USE_BOXWALL}" -eq 1 && -z "${BOXWALL_NAME}" ]]; then
+  echo "Error: --boxwall requires a NAME (the boxwall namespace), e.g. --boxwall proj-a." >&2
+  echo "  Start it first with:  ./boxwall/boxwall.sh --name proj-a" >&2
   exit 2
 fi
 
@@ -465,13 +484,13 @@ if [[ "${USE_BOXWALL}" -eq 1 ]]; then
   fi
   if [[ "$(docker inspect -f '{{.State.Running}}' "${BOXWALL_NAME}" 2>/dev/null || true)" != "true" ]]; then
     echo "Error: --boxwall requested but the boxwall netns holder '${BOXWALL_NAME}' is not running." >&2
-    echo "Start it in another window first:  ./boxwall/boxwall.sh$( [[ "${BOXWALL_NAME}" != "shellbox-boxwall" ]] && echo " --name ${BOXWALL_NAME}" )" >&2
+    echo "Start it in another window first:  ./boxwall/boxwall.sh --name ${BOXWALL_NAME}" >&2
     exit 2
   fi
   # The holder can be up while the interactive proxy/console is down — in that
   # case egress is fail-closed until you (re)start boxwall.sh. Warn, don't block.
   if [[ "$(docker inspect -f '{{.State.Running}}' "${BOXWALL_NAME}-ctl" 2>/dev/null || true)" != "true" ]]; then
-    echo "Warning: boxwall console '${BOXWALL_NAME}-ctl' is not running; egress will be blocked until you run ./boxwall/boxwall.sh." >&2
+    echo "Warning: boxwall console '${BOXWALL_NAME}-ctl' is not running; egress will be blocked until you run ./boxwall/boxwall.sh --name ${BOXWALL_NAME}." >&2
   fi
   DOCKER_ARGS+=( --network "container:${BOXWALL_NAME}" )
 fi

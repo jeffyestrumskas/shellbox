@@ -1,45 +1,22 @@
-# OS
-.DS_Store
-Thumbs.db
+# Default-deny: ignore EVERYTHING, then un-ignore only the canonical scripts,
+# their READMEs, and this file. Anything not whitelisted below — diagnostics
+# (e.g. boxwall-diag.sh), scratch files, local rule state (.shellbox/), secrets,
+# env files, caches — stays out of the repo by default. To track a new file, add
+# an explicit `!`-rule for it here.
+/*
 
-# Editors / IDEs
-*.swp
-*.swo
-*~
-.idea/
-.vscode/
-*.sublime-workspace
+!/.gitignore
+!/README.md
+!/shellbox.sh
 
-# Secrets / env
-.env
-.env.*
-*.pem
-*.key
-*.crt
-*.p12
-credentials.json
-secrets.json
+# boxwall/ — keep only the script + its README (drops boxwall-diag.sh etc.)
+!/boxwall/
+/boxwall/*
+!/boxwall/README.md
+!/boxwall/boxwall.sh
 
-# Python
-__pycache__/
-*.pyc
-.venv/
-venv/
-*.egg-info/
-
-# Node
-node_modules/
-
-# Claude Code (local/personal)
-.claude/
-
-# Docker
-.docker/
-
-# Logs
-*.log
-
-# boxwall — local firewall rules / state (default lives in ~/.shellbox, but
-# ignore here too in case --rules-dir points into the repo)
-.shellbox/
-boxwall-rules.json
+# boxwatch/ — keep only the script + its README
+!/boxwatch/
+/boxwatch/*
+!/boxwatch/README.md
+!/boxwatch/boxwatch.sh
