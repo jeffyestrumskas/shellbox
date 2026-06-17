@@ -4,7 +4,7 @@ set -euo pipefail
 # boxwatch.sh - out-of-box activity recorder for a docker sandbox.
 #
 #   ./boxwatch.sh             # run in its own terminal
-#   ./shellbox.sh --watch     # attach a sandbox from another
+#   ./shellbox.sh --boxwatch  # attach a sandbox from another
 #   ./boxwatch.sh --down      # tear it down
 #
 # One PRIVILEGED container that runs entirely OUTSIDE the sandbox and watches the
@@ -12,14 +12,14 @@ set -euo pipefail
 # it records that box's file, network, and process activity. Because it lives
 # outside the box and writes its JSONL log to a host dir the sandbox never sees,
 # a rogue agent inside the box cannot see, kill, or scrub its own watcher. The
-# sandbox is told which cgroup to watch by shellbox.sh --watch (a registration
+# sandbox is told which cgroup to watch by shellbox.sh --boxwatch (a registration
 # file under ~/.shellbox/watch/targets); the watcher never touches the docker
 # socket. eBPF observes the host kernel directly, so this is INCOMPATIBLE with
 # gVisor (--runsc), whose syscalls never reach the host kernel.
 
 IMAGE_REPO="shellbox-boxwatch"
 PROFILE="default"
-BOXWATCH_NAME="shellbox-boxwatch"      # name shellbox.sh --watch looks for
+BOXWATCH_NAME="shellbox-boxwatch"      # name shellbox.sh --boxwatch looks for
 WATCH_DIR="${HOME}/.shellbox/watch"    # JSONL logs + target registrations
 IMAGE_NAME=""
 NO_BUILD=0
@@ -31,11 +31,11 @@ usage() {
 Usage: ./boxwatch.sh [options]
 
 Out-of-box activity recorder for shellbox sandboxes. Run in its own window, then
-start a sandbox with `./shellbox.sh --watch` in another.
+start a sandbox with `./shellbox.sh --boxwatch` in another.
 
 Options:
   --name NAME          Watcher container name (default: shellbox-boxwatch). Must match
-                       shellbox.sh's --watch-name if you override it.
+                       shellbox.sh's --boxwatch-name if you override it.
   --watch-dir DIR      Where to write logs + read target registrations (default: ~/.shellbox/watch)
   --image IMAGE        Full image name override (e.g. myrepo:tag)
   --rebuild            Force a full rebuild (docker build --no-cache)
@@ -116,7 +116,7 @@ if [[ "$(docker inspect -f '{{.State.Running}}' "${BOXWATCH_NAME}" 2>/dev/null |
 fi
 docker rm -f "${BOXWATCH_NAME}" >/dev/null 2>&1 || true
 
-echo "[boxwatch] starting watcher '${BOXWATCH_NAME}'. Start a sandbox with: ./shellbox.sh --watch$( [[ "${BOXWATCH_NAME}" != "shellbox-boxwatch" ]] && echo " --watch-name ${BOXWATCH_NAME}" )"
+echo "[boxwatch] starting watcher '${BOXWATCH_NAME}'. Start a sandbox with: ./shellbox.sh --boxwatch$( [[ "${BOXWATCH_NAME}" != "shellbox-boxwatch" ]] && echo " --boxwatch-name ${BOXWATCH_NAME}" )"
 
 # Foreground privileged watcher + console. It needs to load eBPF and see the
 # whole host: --privileged for bpftrace, --pid=host so probe PIDs map to host
@@ -197,7 +197,7 @@ stats = {"exec": 0, "open_r": 0, "open_w": 0, "connect": 0,
          "lines": 0, "suspect": 0, "dropped": 0}
 recent = []                 # ring of the last N normalized events (console tail)
 _RECENT_MAX = 1000
-verbose_types = set()       # event types echoed live as they land; empty = quiet
+verbose_types = {"exec", "connect"}  # event types echoed live as they land; empty = quiet
 _lock = threading.Lock()    # guards stats/recent/log against the reader thread
 
 cgid_to_name = {}           # cgroup id -> container name (authoritative, from bpftrace)
@@ -310,7 +310,7 @@ def find_cgroup_path(cid):
 
 def read_targets():
     # Map of container-name -> cgroup path, from the registration files that
-    # shellbox.sh --watch drops here. The watcher never calls docker itself.
+    # shellbox.sh --boxwatch drops here. The watcher never calls docker itself.
     out = {}
     try:
         names = os.listdir(TARGETS_DIR)
@@ -358,12 +358,21 @@ def gen_program(name_to_path):
     # only blur the comm/filename boundary (both are sanitized) instead of
     # shifting a numeric field and crashing the parse — which previously let a
     # box drop its own open/connect events from the log entirely.
+    #
+    # exec is captured from sched:sched_process_exec, NOT syscalls:sys_enter_execve.
+    # At sys_enter the filename is a *userspace* pointer that often isn't faulted in
+    # yet, so str() reads empty on a cold page — making the FIRST exec of a binary
+    # show up with no filename. sched_process_exec fires after the exec succeeds and
+    # exposes filename as a kernel __data_loc string (already copied into the trace
+    # record), so str() always reads the resolved path. It also fires exactly once
+    # per successful exec (no execve retries/duplicates). Trade-off: `comm` here is
+    # the NEW program, not the caller — still box-controllable, hence kept trailing.
     begin = "".join(
         f'printf("Z\\t%d\\t{i}\\n", cgroupid("{_bt_str(path)}"));'
         for i, (_, path) in enumerate(items))
     return r"""
 BEGIN { %(b)s }
-tracepoint:syscalls:sys_enter_execve { %(g)s printf("X\t%%d\t%%d\t%%s\t%%s\n", cgroup, pid, comm, str(args->filename)); }
+tracepoint:sched:sched_process_exec { %(g)s printf("X\t%%d\t%%d\t%%s\t%%s\n", cgroup, pid, comm, str(args->filename)); }
 tracepoint:syscalls:sys_enter_openat { %(g)s printf("O\t%%d\t%%d\t%%d\t%%s\t%%s\n", cgroup, pid, args->flags, comm, str(args->filename)); }
 tracepoint:syscalls:sys_enter_connect {
   %(g)s
@@ -488,12 +497,25 @@ def reader_loop(proc):
     # comm/filename -- we refuse them from then on. This closes the cgid-poisoning
     # vector outright, independent of how many targets share a cgroup id.
     begin_done = False
+    live = False           # announced "capture live" once all BEGIN Z lines arrived
+    z_seen = 0             # BEGIN Z lines received so far (one per target)
     for line in proc.stdout:
         if line.startswith("Z\t"):       # BEGIN-emitted authoritative cgroup id
             if begin_done:
                 continue                  # forged: real Z lines only arrive at BEGIN
             with _lock:
                 handle_cgid(line)
+                z_seen += 1
+                # bpftrace runs BEGIN only AFTER every probe is attached, and emits
+                # all Z lines there before any probe can fire. So the moment we've
+                # received one Z per target, the syscall probes are live and capture
+                # is authoritative. Anything before this point could be missed during
+                # probe attach -- make that boundary explicit. Count Z lines (not
+                # unique cgids) so targets sharing a cgroup id still announce.
+                if not live and target_names and z_seen >= len(target_names):
+                    live = True
+                    log(f"capture live ({len(target_names)} target(s)); "
+                        f"log -> {session_dir}/events.jsonl")
             continue
         if not line.startswith(("X\t", "O\t", "C\t")):
             continue                      # skip bpftrace's "Attaching probes" chatter
@@ -524,21 +546,28 @@ class Tracer:
         self.stop()
         self.paths = dict(name_to_path)
         if not name_to_path:
-            log("no targets registered yet; waiting for ./shellbox.sh --watch ...")
+            log("no targets registered yet; waiting for ./shellbox.sh --boxwatch ...")
             return
         prog = gen_program(name_to_path)
         errlog = open(os.path.join(session_dir, "bpftrace.log"), "a", buffering=1)
         try:
+            # -B line: line-buffer bpftrace's stdout. Over a pipe it defaults to
+            # full (block) buffering, which makes events arrive in delayed bursts on
+            # the console and, worse, discards anything still buffered when we SIGTERM
+            # the process on a target-set change. Line buffering flushes per event.
             self.proc = subprocess.Popen(
-                ["bpftrace", "-e", prog],
+                ["bpftrace", "-B", "line", "-e", prog],
                 stdout=subprocess.PIPE, stderr=errlog, text=True, bufsize=1)
         except FileNotFoundError:
             log(f"{C_NO}FATAL{C_RESET} bpftrace not found in image.")
             raise SystemExit(1)
         self.thread = threading.Thread(target=reader_loop, args=(self.proc,), daemon=True)
         self.thread.start()
-        log(f"watching {', '.join(name_to_path)} ({len(name_to_path)} target(s)); "
-            f"log -> {session_dir}/events.jsonl")
+        # bpftrace is starting but its probes aren't attached yet; events in this
+        # window can be missed. reader_loop prints "capture live" once BEGIN confirms
+        # all probes are attached -- that line marks the start of authoritative capture.
+        log(f"attaching probes for {', '.join(name_to_path)} ({len(name_to_path)} target(s)); "
+            f"events before 'capture live' may be missed during attach...")
 
     def stop(self):
         if self.proc is not None:
@@ -578,7 +607,7 @@ def cmd_help(_args):
         "  tail [N]             show the last N events (default 20)\n"
         "  targets              containers currently being watched\n"
         "  config verbose <what>  echo events live; <what> = on|off|exec|open|connect\n"
-        "                         (combine, e.g. 'config verbose exec connect')\n"
+        "                         (combine, e.g. 'config verbose exec connect'; default: exec,connect)\n"
         "  clear                clear the in-memory tail buffer\n"
         "  quit, exit           stop the watcher (sandboxes keep running, unwatched)"
     )
@@ -619,7 +648,7 @@ def cmd_tail(args):
 
 def cmd_targets(_args):
     if _tracer is None or not _tracer.paths:
-        print("no targets registered (start a sandbox with ./shellbox.sh --watch)")
+        print("no targets registered (start a sandbox with ./shellbox.sh --boxwatch)")
         return
     for name, path in _tracer.paths.items():
         print(f"  {name:<28} {path}")

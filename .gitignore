@@ -20,3 +20,22 @@
 /boxwatch/*
 !/boxwatch/README.md
 !/boxwatch/boxwatch.sh
+
+# agents/ — config templates for shellbox.sh --agent (keep README + per-agent configs)
+!/agents/
+/agents/*
+!/agents/README.md
+!/agents/openclaw/
+/agents/openclaw/*
+!/agents/openclaw/config.json5
+!/agents/hermes/
+/agents/hermes/*
+!/agents/hermes/config.yaml
+!/agents/hermes/env.template
+
+# Defense-in-depth: never commit a real secret/env file, even if a future
+# whitelist above would include it. Config TEMPLATES use a *.template name and
+# are whitelisted explicitly; live secrets render to ~/.shellbox (outside the repo).
+**/.env
+**/.env.*
+**/*.env

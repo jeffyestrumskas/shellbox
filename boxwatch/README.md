@@ -2,6 +2,8 @@
 
 An opt-in, out-of-box activity recorder for a docker sandbox. It is a single self-contained file with the Dockerfile and collector embedded inline; no extra files to manage. Run it in a second window/pane; it records the sandbox's file, network, and process activity to a host log the sandbox can't see, kill, or scrub.
 
+> Part of [shellbox](../README.md#architecture) — see the architecture diagram for how boxwatch fits with the sandbox box and boxwall.
+
 ## Requirements
 
 - Docker Desktop / Docker Engine, able to run a `--privileged` container
@@ -15,10 +17,10 @@ An opt-in, out-of-box activity recorder for a docker sandbox. It is a single sel
 ./boxwatch.sh
 
 # window 2: start a sandbox whose activity is recorded
-shellbox.sh --watch
+shellbox.sh --boxwatch
 ```
 
-`shellbox.sh --watch` refuses to start unless the watcher is already up, so a box can't run un-recorded. Events stream to the watcher window (with `config verbose on`) and are always written as JSONL:
+`shellbox.sh --boxwatch` refuses to start unless the watcher is already up, so a box can't run un-recorded. `exec` and `connect` stream to the window by default (`config verbose on`/`off` to change); all events are always written as JSONL:
 
 ```json
 {"ts": 1749571200.12, "container": "shellbox-watched-8123", "ev": "connect", "pid": 4412, "comm": "curl", "ip": "160.79.104.10", "port": 443}
@@ -30,7 +32,9 @@ shellbox.sh --watch
 
 shellbox.sh (which has docker access on the host) drops a small registration file under `~/.shellbox/watch/targets/` naming the sandbox's container id. The watcher reads it, maps the id to the container's cgroup, and (re)launches `bpftrace` with probes that bail unless the current task is in that cgroup — so it only ever records that one box. It never touches the docker socket.
 
-Three signal types are captured: process **exec** (`sched`/`execve`), **file** opens (`openat`, flagged read vs write), and outbound **network** connects (`connect`, IPv4 address + port). Because the watcher is a privileged container outside the box and its log dir is mounted only into the watcher — never into the sandbox — a rogue agent inside the box can't disable its own watching. Logs land in `~/.shellbox/watch/session-<stamp>/events.jsonl`.
+On each (re)start the watcher prints `attaching probes …` then `capture live …`. **Capture is authoritative only from `capture live` onward** — a command in the brief attach window before it can be missed.
+
+Three event types are captured: process **exec** (`sched:sched_process_exec`; `comm` is the exec'd program), **file** opens (`openat`, read vs write), and outbound **network** connects (`connect`, IPv4 + port). Because the watcher is a privileged container outside the box and its log dir is mounted only into the watcher — never into the sandbox — a rogue agent inside the box can't disable its own watching. Logs land in `~/.shellbox/watch/session-<stamp>/events.jsonl`.
 
 Because event fields (process name, file path) come from the untrusted box, the collector hardens against them in several ways:
 
@@ -53,7 +57,7 @@ Type these in the boxwatch window (`help` lists them):
 | `stats` | Event counts this session, incl. `suspect` (unconfirmed-cgroup) and `dropped` (rate-capped) |
 | `tail [N] [types]` | Show the last N events (default 20); optionally filter to `exec`/`open`/`connect` |
 | `targets` / `ls` | Containers currently being watched |
-| `config` | Show settings; `config verbose <what>` echoes events live, where `<what>` is `on`/`off` or any of `exec`/`open`/`connect` (combinable) |
+| `config` | Show settings; `config verbose <what>` echoes events live, where `<what>` is `on`/`off` or any of `exec`/`open`/`connect` (combinable). Default: `exec,connect` |
 | `clear` | Clear the in-memory tail buffer |
 | `quit` / `exit` | Stop the watcher (sandboxes keep running, unwatched) |
 
@@ -61,7 +65,7 @@ Type these in the boxwatch window (`help` lists them):
 
 | Flag | Description |
 |---|---|
-| `--name NAME` | Watcher container name (default `shellbox-boxwatch`; match with `shellbox.sh --watch-name`) |
+| `--name NAME` | Watcher container name (default `shellbox-boxwatch`; match with `shellbox.sh --boxwatch-name`) |
 | `--watch-dir DIR` | Where to write logs + read target registrations (default `~/.shellbox/watch`) |
 | `--image IMAGE` | Full image name override (e.g. `myrepo:tag`) |
 | `--rebuild` | Force a clean rebuild (needed to pick up collector changes) |

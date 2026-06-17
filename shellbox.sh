@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Resolve this script's own directory so --agent can find the agents/ config
+# templates that ship next to it, regardless of the caller's CWD (shellbox.sh
+# is meant to live in $PATH).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Defaults
 IMAGE_REPO="shellbox-dev"
 PROFILE="default"                 # controls image tag: shellbox-dev:<PROFILE>
@@ -21,7 +26,13 @@ USE_BOXWALL=0                       # opt-in: route egress through the boxwall p
 BOXWALL_NAME=""                       # boxwall namespace to attach to; required with --boxwall (see boxwall.sh)
 USE_CLAW=0                        # opt-in: "openclaw" mode (see --claw below)
 CLAW_PIDS_LIMIT=4096              # fork-bomb guard applied in --claw mode
-USE_WATCH=0                       # opt-in: record activity via the out-of-box boxwatch
+AGENT="claude"                    # which agent to install (see --agent); default claude when none given
+SUPPORTED_AGENTS="claude openclaw hermes"    # valid values for --agent
+CLOUD_AGENTS="openclaw hermes"        # agents wired to Ollama Cloud; each REQUIRES explicit --claw and --boxwall
+OLLAMA_BASE_URL="https://ollama.com/v1"      # Ollama Cloud OpenAI-compatible endpoint (egress via boxwall)
+OLLAMA_MODEL="qwen3-coder:480b-cloud"        # default Ollama Cloud model (--agent-model overrides)
+AGENT_STATE_DIR="${HOME}/.shellbox/agents"   # persistent per-agent state (memory, config)
+USE_BOXWATCH=0                    # opt-in: record activity via the out-of-box boxwatch
 BOXWATCH_NAME="shellbox-boxwatch"     # boxwatch container to register with (see boxwatch.sh)
 WATCH_DIR="${HOME}/.shellbox/watch"   # where boxwatch reads target registrations
 ALLOW_HOST=0                      # opt-out: --allow-host disables the default host-egress block
@@ -105,9 +116,19 @@ Options:
                                                INSIDE the box (default caps + seccomp, working sudo, PID guard) while it
                                                still can't escape to the host. Only host effects: network + the bind mount.
                                                Composes with --boxwall / --runsc for tighter egress / isolation.
-  --watch                                         Record this box's file/network/process activity via a running boxwatch.sh
+  --agent NAME                                    Which agent to install: claude (default), openclaw, or hermes.
+                                               claude (also used when --agent is omitted): installs Claude Code and uses
+                                               your host Claude config; no extra services, runs in any posture.
+                                               openclaw|hermes: installed from their source-of-truth installer, wired to
+                                               Ollama Cloud for models, config rendered in. Each REQUIRES both --claw and
+                                               --boxwall (autonomous in-box + cloud egress gated). Add a messaging channel
+                                               (e.g. a Telegram bot) in the rendered config; agent state (memory, config)
+                                               persists under ~/.shellbox/agents/NAME.
+  --agent-model NAME                              Override the Ollama Cloud model used by openclaw/hermes (default: qwen3-coder:480b-cloud).
+  --boxwatch [NAME]                               Record this box's file/network/process activity via a running boxwatch.sh
                                                (out-of-box eBPF; the box can't see or disable it). Incompatible with --runsc.
-  --watch-name NAME                               Boxwatch container to register with (default: shellbox-boxwatch; implies --watch)
+                                               Optional inline NAME picks the boxwatch container (default: shellbox-boxwatch).
+  --boxwatch-name NAME                            Same as --boxwatch NAME (explicit form; implies --boxwatch)
   --allow-host                                    Disable the default host-egress block (let the box reach host-local
                                                services such as host.docker.internal). The block is ON by default, so
                                                a rogue agent can't reach services bound to your host. No effect with
@@ -124,7 +145,10 @@ Examples:
   ./shellbox.sh --claw                   # "openclaw": autonomous Claude that can install software, locked to the box
   ./shellbox.sh --claw --boxwall proj-a  # same, but every outbound connection is gated by the egress firewall
   ./shellbox.sh --boxwall proj-a         # attach to the boxwall named proj-a (its own rule set)
-  ./shellbox.sh --claw --watch           # same, plus tamper-proof recording of all file/network/process activity
+  ./shellbox.sh --claw --boxwatch        # same, plus tamper-proof recording of all file/network/process activity
+  ./shellbox.sh --agent claude           # explicit: same as the bare default (installs Claude Code)
+  ./shellbox.sh --agent hermes --claw --boxwall proj-a   # build+configure Hermes (Ollama Cloud models), egress gated
+  ./shellbox.sh --agent openclaw --claw --boxwall proj-a # same, for OpenClaw
 EOF
 }
 
@@ -214,7 +238,7 @@ while [[ $# -gt 0 ]]; do
       USE_BOXWALL=1
       # Optional inline name: `--boxwall NAME` is shorthand for `--boxwall-name NAME`.
       # Consume the next token only when it's a bare value (not a flag, not the `--`
-      # command separator), so `--boxwall` alone, `--boxwall --watch`, and
+      # command separator), so `--boxwall` alone, `--boxwall --boxwatch`, and
       # `--boxwall -- cmd` all still work. To run a command under the default
       # boxwall, separate it with `--` (e.g. `--boxwall -- ls -la`).
       if [[ $# -ge 2 && "$2" != "--" && "$2" != -* ]]; then
@@ -233,18 +257,40 @@ while [[ $# -gt 0 ]]; do
       USE_CLAW=1
       shift
       ;;
-    --watch)
-      USE_WATCH=1
+    --agent)
+      [[ $# -ge 2 ]] || { echo "Missing argument for $1 (expected one of: ${SUPPORTED_AGENTS})" >&2; exit 2; }
+      AGENT="$2"
+      case " ${SUPPORTED_AGENTS} " in
+        *" ${AGENT} "*) ;;
+        *) echo "Error: unknown --agent '${AGENT}'. Supported: ${SUPPORTED_AGENTS}." >&2; exit 2 ;;
+      esac
+      shift 2
+      ;;
+    --agent-model)
+      [[ $# -ge 2 ]] || { echo "Missing argument for $1" >&2; exit 2; }
+      OLLAMA_MODEL="$2"
+      shift 2
+      ;;
+    --boxwatch)
+      USE_BOXWATCH=1
+      # Optional inline name: `--boxwatch NAME` is shorthand for `--boxwatch-name NAME`,
+      # mirroring --boxwall. Consume the next token only when it's a bare value (not a
+      # flag, not the `--` command separator), so `--boxwatch` alone, `--boxwatch --claw`,
+      # and `--boxwatch -- cmd` all still work.
+      if [[ $# -ge 2 && "$2" != "--" && "$2" != -* ]]; then
+        BOXWATCH_NAME="$2"
+        shift
+      fi
       shift
       ;;
     --allow-host)
       ALLOW_HOST=1
       shift
       ;;
-    --watch-name)
+    --boxwatch-name)
       [[ $# -ge 2 ]] || { echo "Missing argument for $1" >&2; exit 2; }
       BOXWATCH_NAME="$2"
-      USE_WATCH=1
+      USE_BOXWATCH=1
       shift 2
       ;;
     -h|--help)
@@ -275,13 +321,51 @@ if [[ "${USE_BOXWALL}" -eq 1 && -z "${BOXWALL_NAME}" ]]; then
   exit 2
 fi
 
-# --watch records via host-kernel eBPF, which can't see syscalls a gVisor sandbox
+# --boxwatch records via host-kernel eBPF, which can't see syscalls a gVisor sandbox
 # makes (they're serviced by the runsc sentry in userspace), so the watcher would
 # go blind. Refuse the combination rather than record nothing.
-if [[ "${USE_WATCH}" -eq 1 && "${USE_RUNSC}" -eq 1 ]]; then
-  echo "Error: --watch (host eBPF) can't observe syscalls under gVisor; --watch and --runsc are mutually exclusive." >&2
+if [[ "${USE_BOXWATCH}" -eq 1 && "${USE_RUNSC}" -eq 1 ]]; then
+  echo "Error: --boxwatch (host eBPF) can't observe syscalls under gVisor; --boxwatch and --runsc are mutually exclusive." >&2
   exit 2
 fi
+
+# Agent requirements. Claude is the default and installs into the image, using the
+# host's own Claude config — it needs no extra services and carries no requirements,
+# so it runs in any posture (strict by default; add --claw/--boxwall if you want).
+# The Ollama Cloud agents (openclaw, hermes) are different: they reach the public
+# ollama.com endpoint and run an autonomous agent in-box, so each one must be given
+# BOTH --claw (explicitly — we no longer imply it) and --boxwall (so that cloud
+# egress is approved by the firewall instead of going out silently).
+case " ${CLOUD_AGENTS} " in
+  *" ${AGENT} "*)
+    if [[ "${USE_CLAW}" -ne 1 ]]; then
+      echo "Error: --agent ${AGENT} requires --claw (it installs and runs an autonomous agent in-box)." >&2
+      echo "  e.g.  ./shellbox.sh --agent ${AGENT} --claw --boxwall proj-a" >&2
+      exit 2
+    fi
+    if [[ "${USE_BOXWALL}" -ne 1 ]]; then
+      echo "Error: --agent ${AGENT} requires --boxwall NAME so its Ollama Cloud egress is approved by the firewall." >&2
+      echo "  Start it first with:  ./boxwall/boxwall.sh --name proj-a" >&2
+      echo "  then:                 ./shellbox.sh --agent ${AGENT} --claw --boxwall proj-a" >&2
+      exit 2
+    fi
+
+    # The agents/ template dir must travel next to shellbox.sh (see SCRIPT_DIR).
+    AGENT_TEMPLATE_DIR="${SCRIPT_DIR}/agents/${AGENT}"
+    if [[ ! -d "${AGENT_TEMPLATE_DIR}" ]]; then
+      echo "Error: --agent ${AGENT} needs its config templates at ${AGENT_TEMPLATE_DIR}, but that directory is missing." >&2
+      echo "  The agents/ directory must sit alongside shellbox.sh." >&2
+      exit 2
+    fi
+
+    # The agent can't call any model until the Ollama Cloud key is present. Warn
+    # (don't fail) so you can still build the box and set the key later.
+    if [[ -z "${OLLAMA_API_KEY:-}" ]]; then
+      echo "Warning: OLLAMA_API_KEY is not set on the host; the agent can't reach Ollama Cloud until it is." >&2
+      echo "  Create one at https://ollama.com/settings/keys and re-run (or set it inside the box)." >&2
+    fi
+    ;;
+esac
 
 # Host-egress block (default ON): keep a rogue agent inside the box from reaching
 # services bound to the host (host.docker.internal & the Docker Desktop host range).
@@ -304,14 +388,19 @@ fi
 
 # Compute image name default after args:
 # - If --image not provided, use IMAGE_REPO:PROFILE
+# - claude (the default agent) keeps the lean ":PROFILE" tag. The cloud agents
+#   (with the agent baked in) append their name so each is a
+#   distinct, separately-cached image and the default image stays small.
 if [[ -z "${IMAGE_NAME}" ]]; then
-  IMAGE_NAME="${IMAGE_REPO}:${PROFILE}"
+  _agent_tag=""
+  [[ "${AGENT}" != "claude" ]] && _agent_tag="-${AGENT}"
+  IMAGE_NAME="${IMAGE_REPO}:${PROFILE}${_agent_tag}"
 fi
 
-# --watch needs a deterministic container name so the out-of-box watcher can map
+# --boxwatch needs a deterministic container name so the out-of-box watcher can map
 # this sandbox to its cgroup. Give it one if the user didn't (PID keeps it unique
 # across concurrent watched sandboxes).
-if [[ "${USE_WATCH}" -eq 1 && -z "${CONTAINER_NAME}" ]]; then
+if [[ "${USE_BOXWATCH}" -eq 1 && -z "${CONTAINER_NAME}" ]]; then
   CONTAINER_NAME="shellbox-watched-$$"
 fi
 
@@ -348,8 +437,10 @@ if [[ "${NO_BUILD}" -eq 0 ]]; then
   fi
 
   DOCKERFILE_HASH="$(sha256_file "${TMPDIR_BUILD}/Dockerfile")"
-  # Include UID/GID in the cache key so a different user triggers a rebuild
-  CACHE_KEY="${DOCKERFILE_HASH}:${HOST_UID}:${HOST_GID}"
+  # Include UID/GID and the selected agent in the cache key so a different user
+  # or a different --agent triggers a rebuild (the agent is a build-arg, so the
+  # Dockerfile text alone doesn't capture it).
+  CACHE_KEY="${DOCKERFILE_HASH}:${HOST_UID}:${HOST_GID}:agent=${AGENT:-none}"
 
   existing_hash="$(
     docker image inspect "${IMAGE_NAME}" \
@@ -361,6 +452,7 @@ if [[ "${NO_BUILD}" -eq 0 ]]; then
       $( (( REBUILD )) && echo "--no-cache" ) \
       --build-arg HOST_UID="${HOST_UID}" \
       --build-arg HOST_GID="${HOST_GID}" \
+      --build-arg AGENT="${AGENT:-none}" \
       --label "shellbox.dockerfile_sha256=${CACHE_KEY}" \
       -t "${IMAGE_NAME}" \
       "${TMPDIR_BUILD}"
@@ -452,10 +544,27 @@ DOCKER_ARGS=(
 # workdir. We still run as your host UID, so files the agent creates in the
 # workdir remain host-owned (sudo grants in-container root only when needed).
 if [[ "${USE_CLAW}" -eq 1 ]]; then
-  # No --cap-drop and no no-new-privileges here, on purpose: that's what lets the
-  # agent install software. Host isolation is preserved by NOT adding any of the
+  # No --cap-drop ALL and no no-new-privileges here, on purpose: that's what lets
+  # the agent install software. Host isolation is preserved by NOT adding any of the
   # dangerous escapes (--privileged, docker socket, host mounts, --pid=host, ...).
-  DOCKER_ARGS+=( --pids-limit "${CLAW_PIDS_LIMIT}" )
+  #
+  # BUT we still strip the two network-admin caps from the default set:
+  #   NET_RAW   - with it the box can open an AF_PACKET/SOCK_RAW socket and inject
+  #               raw L2 frames straight to the wire. AF_PACKET TX goes
+  #               dev_queue_xmit and NEVER traverses netfilter's LOCAL_OUT hook, so
+  #               it sidesteps boxwall's entire iptables OUTPUT egress filter AND
+  #               produces no connect() for boxwatch to see. boxwall's threat model
+  #               (boxwall/README.md) assumes the box can't do this.
+  #   NET_ADMIN - lets the box rewrite iptables / set SO_MARK (forge the proxy's
+  #               fwmark exemption) in the shared netns. Not in Docker's default set
+  #               today, dropped here belt-and-braces so a default change can't
+  #               silently re-open it.
+  # apt/sudo/dpkg need neither, so installs still work.
+  DOCKER_ARGS+=(
+    --pids-limit "${CLAW_PIDS_LIMIT}"
+    --cap-drop NET_RAW
+    --cap-drop NET_ADMIN
+  )
 else
   # Light sandboxing (remove --cap-drop ALL if it breaks something you need)
   DOCKER_ARGS+=(
@@ -474,17 +583,33 @@ if [[ "${USE_RUNSC}" -eq 1 ]]; then
   fi
 fi
 
+# Both --boxwall and --boxwatch are fail-closed: each depends on a helper that must
+# already be running in its own window. Check both up front and, if either is down,
+# print the exact command to start EVERY missing one — so the user can launch them
+# all at once rather than discovering them one failed run at a time.
+_missing=()
+if [[ "${USE_BOXWALL}" -eq 1 ]] \
+   && [[ "$(docker inspect -f '{{.State.Running}}' "${BOXWALL_NAME}" 2>/dev/null || true)" != "true" ]]; then
+  _missing+=( "boxwall '${BOXWALL_NAME}' is not running. Start it in another window with:"$'\n'"      ./boxwall/boxwall.sh --name ${BOXWALL_NAME}" )
+fi
+if [[ "${USE_BOXWATCH}" -eq 1 ]] \
+   && [[ "$(docker inspect -f '{{.State.Running}}' "${BOXWATCH_NAME}" 2>/dev/null || true)" != "true" ]]; then
+  _missing+=( "boxwatch '${BOXWATCH_NAME}' is not running. Start it in another window with:"$'\n'"      ./boxwatch/boxwatch.sh$( [[ "${BOXWATCH_NAME}" != "shellbox-boxwatch" ]] && echo " --name ${BOXWATCH_NAME}" )" )
+fi
+if (( ${#_missing[@]} )); then
+  echo "Error: required service(s) not running:" >&2
+  for _m in "${_missing[@]}"; do
+    printf '  - %s\n' "${_m}" >&2
+  done
+  exit 2
+fi
+
 # Opt-in boxwall: share the boxwall container's network namespace so ALL egress is
-# forced through its interactive proxy (see boxwall.sh). Fail-closed: if the boxwall
-# isn't running, refuse to start rather than fall back to unfiltered network.
+# forced through its interactive proxy (see boxwall.sh). The holder is confirmed
+# running above; here we reject incompatible flags and wire up the netns.
 if [[ "${USE_BOXWALL}" -eq 1 ]]; then
   if (( ${#PORTS[@]} )) || (( ${#NETWORKS[@]} )); then
     echo "Error: --boxwall shares the boxwall's network namespace, so -p/--port and -N/--network can't be used with it (publish ports on the boxwall instead)." >&2
-    exit 2
-  fi
-  if [[ "$(docker inspect -f '{{.State.Running}}' "${BOXWALL_NAME}" 2>/dev/null || true)" != "true" ]]; then
-    echo "Error: --boxwall requested but the boxwall netns holder '${BOXWALL_NAME}' is not running." >&2
-    echo "Start it in another window first:  ./boxwall/boxwall.sh --name ${BOXWALL_NAME}" >&2
     exit 2
   fi
   # The holder can be up while the interactive proxy/console is down — in that
@@ -495,24 +620,19 @@ if [[ "${USE_BOXWALL}" -eq 1 ]]; then
   DOCKER_ARGS+=( --network "container:${BOXWALL_NAME}" )
 fi
 
-# Opt-in watch: record this box's activity via the out-of-box boxwatch. Fail-closed:
-# if the watcher isn't running, refuse to start rather than run an unwatched box (the
-# whole point is that a rogue agent can't run un-recorded). Nothing is added to
-# DOCKER_ARGS — the watcher observes from outside; we only register this box's name so
-# a background helper can hand the watcher its container id once it exists.
-if [[ "${USE_WATCH}" -eq 1 ]]; then
-  if [[ "$(docker inspect -f '{{.State.Running}}' "${BOXWATCH_NAME}" 2>/dev/null || true)" != "true" ]]; then
-    echo "Error: --watch requested but the watcher '${BOXWATCH_NAME}' is not running." >&2
-    echo "Start it in another window first:  ./boxwatch/boxwatch.sh$( [[ "${BOXWATCH_NAME}" != "shellbox-boxwatch" ]] && echo " --name ${BOXWATCH_NAME}" )" >&2
-    exit 2
-  fi
+# Opt-in watch: record this box's activity via the out-of-box boxwatch. The watcher
+# is confirmed running above (fail-closed: a rogue agent can't run un-recorded).
+# Nothing is added to DOCKER_ARGS — the watcher observes from outside; we only
+# register this box's name so a background helper can hand the watcher its container
+# id once it exists.
+if [[ "${USE_BOXWATCH}" -eq 1 ]]; then
   # The watcher's integrity rests on the box NOT being able to write to WATCH_DIR
   # (where target registrations live). If WATCH_DIR is inside the bind-mounted
   # workdir, a rogue box could forge/redirect targets — refuse rather than pretend.
   _watch_abs="$(abs_host_path "${WATCH_DIR}")"
   case "${_watch_abs%/}/" in
     "${PWD_ABS%/}/"*)
-      echo "Error: --watch dir (${_watch_abs}) is inside the bind-mounted workdir (${PWD_ABS}); the box could tamper with its own watcher." >&2
+      echo "Error: --boxwatch dir (${_watch_abs}) is inside the bind-mounted workdir (${PWD_ABS}); the box could tamper with its own watcher." >&2
       echo "Point boxwatch at a dir outside this tree (boxwatch.sh --watch-dir ...) or run shellbox from elsewhere." >&2
       exit 2 ;;
   esac
@@ -560,6 +680,48 @@ if (( ${#EXTRA_MOUNTS[@]} )); then
   done
 fi
 
+# Opt-in cloud agent: install/configure mode (openclaw, hermes). Mount a persistent
+# per-agent state dir (agent memory/config survive --rm) and the agent's config
+# template (read-only) for the entrypoint to render. Inject the Ollama Cloud env the
+# templates read. Egress to ollama.com is gated by the required --boxwall. Claude
+# needs none of this (it uses host config). A user-facing messaging channel (e.g. a
+# Telegram bot — its own account, so it can't impersonate you) is configured in the
+# rendered agent config; nothing here touches your personal accounts.
+case " ${CLOUD_AGENTS} " in
+  *" ${AGENT} "*)
+  # In-box state location differs per agent.
+  case "${AGENT}" in
+    openclaw) _agent_state_target="/home/dev/.config/openclaw" ;;
+    hermes)   _agent_state_target="/home/dev/.hermes" ;;
+  esac
+  mkdir -p "${AGENT_STATE_DIR}/${AGENT}/state"
+  DOCKER_ARGS+=(
+    -v "${AGENT_STATE_DIR}/${AGENT}/state:${_agent_state_target}"
+    -v "${AGENT_TEMPLATE_DIR}:/run/shellbox-agent:ro"
+  )
+
+  # Splice the agent's env in as DEFAULTS — after the preset defaults but before
+  # any user -e entries — so an explicit `-e OLLAMA_MODEL=...` still wins (Docker
+  # honors the last -e for a given key). OLLAMA_API_KEY is forwarded from the host
+  # only when present; absent ones render as empty placeholders.
+  _agent_env=(
+    "SHELLBOX_AGENT=${AGENT}"
+    "OLLAMA_BASE_URL=${OLLAMA_BASE_URL}"
+    "OLLAMA_MODEL=${OLLAMA_MODEL}"
+  )
+  [[ -n "${OLLAMA_API_KEY:-}" ]]   && _agent_env+=( "OLLAMA_API_KEY=${OLLAMA_API_KEY}" )
+  _ndefault=${#DEFAULT_ENV_VARS[@]}
+  _user_env=()
+  # Capture user -e entries (those beyond the presets) only if any exist; expanding
+  # an empty array under `set -u` trips macOS bash 3.2 ("unbound variable").
+  if (( ${#ENV_VARS[@]} > _ndefault )); then
+    _user_env=( "${ENV_VARS[@]:${_ndefault}}" )
+  fi
+  ENV_VARS=( "${DEFAULT_ENV_VARS[@]}" "${_agent_env[@]}" )
+  (( ${#_user_env[@]} )) && ENV_VARS+=( "${_user_env[@]}" )
+  ;;
+esac
+
 # Env vars
 if (( ${#ENV_VARS[@]} )); then
   for e in "${ENV_VARS[@]}"; do
@@ -584,17 +746,28 @@ fi
 # Claw posture banner: make the relaxed-inside / locked-to-host trade explicit.
 if [[ "${USE_CLAW}" -eq 1 ]]; then
   printf '\033[1;33m[shellbox:claw]\033[0m openclaw mode — the agent can install software and run freely INSIDE this box.\n' >&2
-  printf '  host isolation kept: no privileged, no docker socket, no host mounts beyond the workdir; default caps + seccomp.\n' >&2
+  printf '  host isolation kept: no privileged, no docker socket, no host mounts beyond the workdir; default caps minus NET_RAW/NET_ADMIN + seccomp.\n' >&2
   printf '  only host effects: outbound network%s and writes to the bind mount (%s).\n' \
     "$( [[ "${USE_BOXWALL}" -eq 1 ]] && echo " (gated by boxwall)" )" "${PWD_ABS}" >&2
   printf '  pids-limit=%s%s\n' "${CLAW_PIDS_LIMIT}" "$( [[ "${USE_RUNSC}" -eq 1 ]] && echo ", gVisor on" )" >&2
 fi
 
+# Cloud-agent installer banner: name the agent, its model endpoint, and state dir.
+case " ${CLOUD_AGENTS} " in
+  *" ${AGENT} "*)
+  printf '\033[1;35m[shellbox:agent]\033[0m %s installed — models via Ollama Cloud (%s), egress gated by boxwall %s.\n' \
+    "${AGENT}" "${OLLAMA_MODEL}" "${BOXWALL_NAME}" >&2
+  printf '  config rendered on first run; agent state persists on the host at %s.\n' "${AGENT_STATE_DIR}/${AGENT}" >&2
+  [[ -z "${OLLAMA_API_KEY:-}" ]] && \
+    printf '  note: OLLAMA_API_KEY is unset — set it (ollama.com/settings/keys) before the agent can call models.\n' >&2
+  ;;
+esac
+
 # Watch registrar: the container doesn't exist until `docker run` below, so spawn
 # a background helper that waits for it to appear, then records its id where the
 # out-of-box watcher will pick it up and scope its eBPF probes to this cgroup. The
 # EXIT trap removes the registration when the box stops.
-if [[ "${USE_WATCH}" -eq 1 ]]; then
+if [[ "${USE_BOXWATCH}" -eq 1 ]]; then
   mkdir -p "${WATCH_DIR}/targets"
   WATCH_TARGET_FILE="${WATCH_DIR}/targets/${CONTAINER_NAME}.json"
   (
@@ -614,8 +787,8 @@ fi
 
 # Host-egress block helper: the box's netns doesn't exist until `docker run` below,
 # so spawn a background helper that waits for the box to be running, joins its netns
-# with NET_ADMIN, and installs DROP rules for the host-local ranges — then signals the
-# entrypoint (which is blocking) by writing <gate>/ready. The box itself keeps
+# with NET_ADMIN, and installs DROP rules for the host-local ranges — then unblocks the
+# entrypoint (which is waiting) by writing <gate>/ready. The box itself keeps
 # --cap-drop ALL, so it can never see this helper or remove the rules it leaves behind.
 # Fail-closed: if the helper can't apply the rules, no sentinel is written and the
 # entrypoint refuses to start the shell.
@@ -689,6 +862,12 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Selected agent (claude|openclaw|hermes); "none" only for a raw docker build that
+# passes no build-arg (shellbox always passes one, defaulting to claude). Declared
+# once for the whole stage so every RUN below can branch on it; folded into
+# shellbox's image tag + cache key so agent images are distinct and cached.
+ARG AGENT=none
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash ca-certificates curl wget less \
     vim tmux git openssh-client \
@@ -726,6 +905,11 @@ RUN set -eux; \
     mkdir -p /home/dev/work; \
     chown -R "${HOST_UID}:${HOST_GID}" /home/dev/work || true
 
+# No messaging bridge is baked into the image. A user-facing channel is a
+# separate-identity bot (e.g. a Telegram bot via @BotFather — its own account, so a
+# misbehaving agent can't impersonate you), configured in the rendered agent config
+# at runtime. Keeps the image lean and avoids any device-linking trust model.
+
 # Helper: pre-accept Claude Code's interactive sandbox dialogs, each gated by an
 # env var passed in at runtime (so toggling needs no rebuild). Runs in-container
 # (python3 is always present here), so it works even if the host lacked python3.
@@ -758,6 +942,32 @@ RUN printf '%s\n' \
   '    s["skipDangerousModePermissionPrompt"] = True' \
   '    save(p, s)' \
   > /usr/local/bin/ensure-claude-config.py
+
+# Helper: render the mounted agent config template(s) into the box's persistent
+# state dir, substituting ${OLLAMA_*}/${TELEGRAM_*} placeholders from the env. Runs
+# at startup when SHELLBOX_AGENT is set. NEVER overwrites an already-rendered
+# config, so edits (e.g. adding a messaging channel) survive across runs. Templates
+# are mounted read-only at /run/shellbox-agent by shellbox.
+RUN printf '%s\n' \
+  'import os' \
+  'agent = os.environ.get("SHELLBOX_AGENT")' \
+  'src_dir = "/run/shellbox-agent"' \
+  'home = os.path.expanduser("~")' \
+  'MAP = {' \
+  '    "openclaw": [("config.json5", os.path.join(home, ".config/openclaw/config.json5"))],' \
+  '    "hermes": [("config.yaml", os.path.join(home, ".hermes/config.yaml")),' \
+  '               ("env.template", os.path.join(home, ".hermes/.env"))],' \
+  '}' \
+  'KEYS = ("OLLAMA_BASE_URL", "OLLAMA_API_KEY", "OLLAMA_MODEL", "TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOW_FROM")' \
+  'for src_name, dst in MAP.get(agent, []):' \
+  '    src = os.path.join(src_dir, src_name)' \
+  '    if not os.path.exists(src) or os.path.exists(dst):' \
+  '        continue' \
+  '    with open(src) as f: text = f.read()' \
+  '    for k in KEYS: text = text.replace("${%s}" % k, os.environ.get(k, ""))' \
+  '    os.makedirs(os.path.dirname(dst), exist_ok=True)' \
+  '    with open(dst, "w") as f: f.write(text)' \
+  > /usr/local/bin/render-agent-config.py
 
 # Entrypoint: copies host Claude config into container on startup, prints summary
 RUN printf '%s\n' \
@@ -804,20 +1014,55 @@ RUN printf '%s\n' \
   '  done' \
   '  printf "\033[1;36m[shellbox]\033[0m host-egress block active: host-local services are unreachable from this box.\n"' \
   'fi' \
+  '# Agent mode: render the default config (first run only) and print next steps.' \
+  'if [ -n "${SHELLBOX_AGENT:-}" ]; then' \
+  '  python3 /usr/local/bin/render-agent-config.py 2>/dev/null || true' \
+  '  printf "\033[1;35m[shellbox:agent]\033[0m %s ready.\n" "$SHELLBOX_AGENT"' \
+  '  printf "  config: %s/.config or ~/.hermes (rendered on first run; edit to add a messaging channel).\n" "$HOME"' \
+  '  printf "  chat in this terminal:  %s --help   (look for a chat/run/repl subcommand)\n" "$SHELLBOX_AGENT"' \
+  'fi' \
   'exec "$@"' \
   > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
 WORKDIR /home/dev/work
 USER dev
 
-# Install Claude Code CLI (official method)
-RUN curl -fsSL https://claude.ai/install.sh | bash
+# Install Claude Code CLI (official method) — only for --agent claude (the default).
+# openclaw/hermes boxes don't get Claude; they install their own agent below.
+RUN set -eux; if [ "${AGENT}" = claude ]; then curl -fsSL https://claude.ai/install.sh | bash; fi
 
 RUN printf "%s\n" \
   'export PS1="\[\e[1;32m\](shellbox)\[\e[0m\] \u@\h:\w\$ "' \
   'export PIP_DISABLE_PIP_VERSION_CHECK=1' \
   'export PATH="$HOME/.local/bin:$PATH"  # where the claude installer lands' \
   >> ~/.bashrc
+
+# Agent mode (dev layer): install the selected agent from its source-of-truth
+# installer. Network is available at BUILD time (boxwall only gates the RUNTIME
+# container's egress), so the installers fetch normally here. AGENT=none is a
+# no-op, keeping the plain image unchanged in behavior.
+#   - openclaw: official one-line installer (lands a CLI on $HOME/.local/bin).
+#   - hermes:   from source per request. Ubuntu 24.04 is PEP-668 externally-
+#               managed, so a bare `pip install -e .` is refused; use a venv and
+#               put it on PATH.
+RUN set -eux; \
+    case "${AGENT}" in \
+      openclaw) \
+        curl -fsSL https://openclaw.ai/install.sh | bash ;; \
+      hermes) \
+        git clone --depth 1 https://github.com/NousResearch/hermes-agent "$HOME/hermes-agent"; \
+        python3 -m venv "$HOME/.hermes-venv"; \
+        "$HOME/.hermes-venv/bin/pip" install --upgrade pip; \
+        "$HOME/.hermes-venv/bin/pip" install -e "$HOME/hermes-agent"; \
+        printf '%s\n' 'export PATH="$HOME/.hermes-venv/bin:$PATH"' >> "$HOME/.bashrc" ;; \
+      claude|none) : ;; \
+    esac
+
+# UTF-8 locale so Unicode output (agent TUIs, box-drawing, emoji) renders instead
+# of "?" — the default C/POSIX locale is ASCII-only. C.UTF-8 is built into glibc,
+# so no locales package is needed. Placed last so it only re-runs the cheap final
+# layers on a rebuild.
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["bash", "-l"]

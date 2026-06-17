@@ -1,0 +1,49 @@
+// shellbox default config for OpenClaw (https://docs.openclaw.ai).
+//
+// This is a TEMPLATE: the ${...} placeholders are substituted from the
+// container's environment by shellbox on first run, then written to
+// ~/.config/openclaw/config.json5 in the persistent state mount. shellbox
+// never overwrites an already-rendered config, so any edits you make here
+// (e.g. adding a messaging channel) survive across runs.
+//
+// Models are served by Ollama Cloud's OpenAI-compatible endpoint; all egress
+// is gated by the required --boxwall firewall.
+{
+  // LLM provider: Ollama Cloud, spoken as OpenAI-compatible.
+  models: {
+    providers: [
+      {
+        id: "ollama-cloud",
+        type: "openai",
+        baseUrl: "${OLLAMA_BASE_URL}",
+        apiKey: "${OLLAMA_API_KEY}",
+        models: [
+          { id: "${OLLAMA_MODEL}" },
+        ],
+      },
+    ],
+  },
+
+  // Point the agent's chat + small models at the Ollama Cloud model above.
+  agents: {
+    defaults: {
+      models: {
+        chat: "${OLLAMA_MODEL}",
+        small: "${OLLAMA_MODEL}",
+      },
+    },
+  },
+
+  // Messaging channel: configure a SEPARATE-IDENTITY bot here (recommended:
+  // Telegram via @BotFather — its own account, so it can't impersonate you or read
+  // your other chats). Until one is set there is no channel and you drive the agent
+  // from the box terminal. Example (confirm keys vs OpenClaw docs):
+  //
+  // channels: {
+  //   telegram: {
+  //     enabled: true,
+  //     botToken: "${TELEGRAM_BOT_TOKEN}",      // from @BotFather
+  //     allowFrom: ["${TELEGRAM_ALLOW_FROM}"],  // your numeric Telegram user id
+  //   },
+  // },
+}

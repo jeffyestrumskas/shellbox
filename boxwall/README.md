@@ -2,6 +2,8 @@
 
 An opt-in, interactive egress firewall for a docker container. It is a single self-contained file with the Dockerfile and proxy embedded inline; no extra files to manage. Run it in a second window/pane; every new outbound connection from the sandbox is paused and approved by hand.
 
+> Part of [shellbox](../README.md#architecture) — see the architecture diagram for how boxwall fits with the sandbox box and boxwatch.
+
 ## Requirements
 
 - Docker Desktop / Docker Engine **28+** (boxwall sets a per-interface `route_localnet` sysctl via the network endpoint driver option that 28 introduced; the script does this automatically, but older engines won't run it)
@@ -34,7 +36,7 @@ The `--name` namespace is required and scopes the rules file, so the rules dir (
 
 ## How it works
 
-boxwall runs a persistent netns holder that the sandbox joins and a foreground proxy/console, so you can rerun `boxwall.sh` without dropping the sandbox's network. The sandbox keeps `--cap-drop ALL` so it can't rewrite the rules, and since it shares the holder's namespace, `-p`/`-N` don't work with `--boxwall`.
+boxwall runs a persistent netns holder that the sandbox joins and a foreground proxy/console, so you can rerun `boxwall.sh` without dropping the sandbox's network. The sandbox has no `NET_ADMIN` or `NET_RAW` — default boxes run `--cap-drop ALL`; `--claw`/`--agent` boxes keep Docker's default caps but with `NET_RAW`/`NET_ADMIN` dropped — so it can neither rewrite the rules nor inject raw packets past them (and since it shares the holder's namespace, `-p`/`-N` don't work with `--boxwall`).
 
 All TCP is gated by the prompt, and DNS is prompted once per resolver. Everything else is dropped, including QUIC, ICMP, IPv6, and DNS to any other resolver.
 
