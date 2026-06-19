@@ -11,8 +11,11 @@ set -euo pipefail
 # namespace + egress (the sandbox joins THIS), and a foreground proxy/console
 # (-ctl) sharing the netns to gate traffic. Rerunning boxwall.sh keeps the holder
 # up; while the console is down egress is fail-closed. The proxy peeks the TLS
-# SNI / HTTP Host (no decryption) and prompts o/u/f/d; DNS prompts once per
-# resolver; everything else (ICMP/SCTP/QUIC/IPv6) drops.
+# SNI / HTTP Host (no decryption) and prompts for a decision: an action
+# (allow / deny) + a duration (once / until-quit / forever / timed) plus an
+# optional scope (this host:port /
+# any port on host / any host on port / domain+subdomains / any connection); DNS
+# prompts once per resolver; everything else (ICMP/SCTP/QUIC/IPv6) drops.
 
 IMAGE_REPO="shellbox-boxwall"
 PROFILE="default"
@@ -44,9 +47,13 @@ Options:
                        sandboxes lose network until a boxwall is started again.
   -h, --help           Show help
 
-Prompts (per new destination):
-  o = allow once      u = allow until boxwall quits
-  f = allow forever   d = deny (default if you just press Enter)
+Prompts (per new destination) — type <action><duration>[scope]. Action: a=allow
+d=deny. Duration: o=once  q=until-quit  f=forever  1m/1h=timed. Scope (append a
+letter): h=any port on host  p=any host on port
+s=domain+subdomains  *=any connection. e.g. 'af*' = allow any connection forever,
+'aqs' = allow this domain until quit, 'df' = deny forever, 'dfs' = deny a whole
+domain forever. Default scope is the exact host:port; a bare Enter (or d) denies
+just this one connection.
 
 Console commands (type in the boxwall window): help, rules, history, config,
 allow, forget, reload, clear, quit. Type 'help' for details.
@@ -265,6 +272,7 @@ import socket
 import struct
 import subprocess
 import sys
+import time
 
 SO_ORIGINAL_DST = 80
 IP_ORIGDSTADDR = 20         # IP_RECVORIGDSTADDR; recovers DNAT'd UDP dst
@@ -278,11 +286,19 @@ C_HDR = "\033[1;36m"
 C_ASK = "\033[1;33m"
 C_OK = "\033[32m"
 C_NO = "\033[31m"
+C_B = "\033[1m"          # bold; highlights the keys you actually type
+C_DIM = "\033[2m"
 
-session_allow = set()   # allow-until-quit (memory only)
+session_allow = set()   # allow-until-quit / timed (memory only)
+session_expiry = {}     # allow rule-key -> epoch seconds; only for timed rules
 forever_allow = set()   # allow-forever (persisted)
+session_deny = set()    # deny-until-quit / timed (memory only)
+deny_expiry = {}        # deny rule-key -> epoch seconds; only for timed rules
+forever_deny = set()    # deny-forever (persisted); takes precedence over allow
 decision_q = None       # Queue of (host, port, future); set in main()
 verbose = False         # log every allowed connection
+log_blocks = True       # log the first time a deny rule auto-blocks a dest
+_deny_logged = set()    # (host,port) already logged as auto-denied; dedupe spam
 stats = {"seen": 0, "allowed": 0, "denied": 0}
 access_log = {}         # host -> {count, denied, ports}; session only
 _resolve_cache = {}     # host -> set(ip): name<->dest-IP cross-check cache
@@ -313,8 +329,11 @@ class QuitConsole(Exception):
 def load_rules():
     try:
         with open(RULES_FILE) as f:
-            for h in json.load(f).get("allow", []):
-                forever_allow.add(h)
+            data = json.load(f)
+        for h in data.get("allow", []):
+            forever_allow.add(h)
+        for h in data.get("deny", []):
+            forever_deny.add(h)
     except Exception:
         pass
 
@@ -324,7 +343,8 @@ def save_rules():
         os.makedirs(os.path.dirname(RULES_FILE), exist_ok=True)
         tmp = RULES_FILE + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"allow": sorted(forever_allow)}, f, indent=2)
+            json.dump({"allow": sorted(forever_allow),
+                       "deny": sorted(forever_deny)}, f, indent=2)
         os.replace(tmp, RULES_FILE)
     except Exception as e:
         print(f"[boxwall] WARN: could not persist rules: {e}", file=sys.stderr)
@@ -649,16 +669,119 @@ async def name_matches_ip(host, ip):
     return ip in ips
 
 
-def matches(host, port):
-    # Rules key on (host, port): a bare "host" matches any port; an f/u rule
-    # pins the port.
+def parent_domain(host):
+    # Best-effort registrable domain for the "domain + subdomains" scope: the
+    # last two labels (api.anthropic.com -> anthropic.com). A literal IP or a
+    # single-label name has no domain. This is necessarily a heuristic (it
+    # doesn't know multi-part TLDs like .co.uk).
+    if _IP_RE.match(host):
+        return None
+    labels = host.split(".")
+    if len(labels) < 2:
+        return None
+    return ".".join(labels[-2:])
+
+
+def scope_target(host, port, scope):
+    # Map a scope letter to the rule key it should store and a human label.
+    # None/"" -> this exact host:port (the default, narrowest scope).
+    #   a -> "*"            any connection (every host, every port)
+    #   p -> "*:PORT"       any host on this port
+    #   h -> "host"         any port on this host (bare host)
+    #   s -> "*.domain"     this domain and all its subdomains (any port)
+    if scope == "a":
+        return "*", "any connection"
+    if scope == "p":
+        return f"*:{port}", f"any host on port {port}"
+    if scope == "h":
+        return host, f"any port on {host}"
+    if scope == "s":
+        dom = parent_domain(host)
+        if dom:
+            return f"*.{dom}", f"*.{dom} (domain + subdomains)"
+        # No domain to generalize to (IP / single label) -> fall back to exact.
+    return f"{host}:{port}", f"{host}:{port}"
+
+
+def _rule_live(key, store, expiry):
+    # A timed session rule is live until its expiry; sweep it on expiry so it
+    # stops matching (and the rules listing reflects reality).
+    exp = expiry.get(key)
+    if exp is None:
+        return True
+    if exp > time.time():
+        return True
+    store.discard(key)
+    expiry.pop(key, None)
+    return False
+
+
+def _covered_by(store, host, port, expiry=None):
+    # Returns the matching rule key in `store` covering (host, port), or None.
+    # (A key string is truthy and None falsy, so boolean callers are unaffected.)
+    # Handles the global wildcard, per-port wildcard, bare-host (any port), exact
+    # host:port, and *.domain subdomain rules. Pass `expiry` for a session store
+    # so expired timed rules are swept and don't count as matches. Keys are tried
+    # most-specific first so the reported match is the meaningful one.
+    keys = []
     hp = f"{host}:{port}"
-    return (host in forever_allow or hp in forever_allow
-            or host in session_allow or hp in session_allow)
+    if hp in store:
+        keys.append(hp)
+    if host in store:
+        keys.append(host)
+    for rule in store:
+        if rule.startswith("*."):
+            base = rule[2:]                      # "*.anthropic.com" -> "anthropic.com"
+            if host == base or host.endswith("." + base):
+                keys.append(rule)
+    pw = f"*:{port}"
+    if pw in store:
+        keys.append(pw)
+    if "*" in store:
+        keys.append("*")
+    if not keys:
+        return None
+    if expiry is None:
+        return keys[0]
+    for k in keys:
+        if _rule_live(k, store, expiry):
+            return k
+    return None
+
+
+def matches(host, port):
+    # Allow-list match (the name 'matches' is kept for existing callers).
+    return (_covered_by(forever_allow, host, port)
+            or _covered_by(session_allow, host, port, session_expiry))
+
+
+def matches_deny(host, port):
+    # Deny-list match; checked before the allow-list so an explicit block wins.
+    return (_covered_by(forever_deny, host, port)
+            or _covered_by(session_deny, host, port, deny_expiry))
+
+
+def _log_deny(host, port, rule):
+    # Surface auto-blocks once per (host,port) so deny rules aren't invisible,
+    # without spamming a line per connection. `history`/deny counts show volume.
+    if not log_blocks:
+        return
+    sig = (host, port)
+    if sig in _deny_logged:
+        return
+    if len(_deny_logged) > _ACCESS_LOG_MAX:
+        _deny_logged.clear()
+    _deny_logged.add(sig)
+    via = "" if rule == f"{host}:{port}" else f" {C_DIM}({rule}){C_RESET}"
+    print(f"\n[boxwall] {C_NO}blocked{C_RESET} {host}:{port} by deny rule{via}")
 
 
 async def decide(host, port, ip):
-    # Known destinations skip the queue.
+    # Explicit deny rules win and never prompt; then known allows skip the queue.
+    dkey = matches_deny(host, port)
+    if dkey:
+        _log_deny(host, port, dkey)
+        return False
     if matches(host, port):
         return True
     # Coalesce concurrent connections to the SAME destination onto one prompt.
@@ -857,34 +980,52 @@ def on_dns_readable(listener):
 
 def cmd_help(args):
     print(
-        "commands (type and press Enter):\n"
-        "  help, h, ?           show this help\n"
-        "  rules, ls            list active allow rules (forever + until-quit)\n"
-        "  history, log         hosts accessed this session (history clear to reset)\n"
-        "  config               show settings + stats\n"
-        "  config verbose on|off  log every allowed connection\n"
-        "  allow <host[:port]>  add allow-forever rule(s) (bare host = any port)\n"
-        "  forget <host[:port]> remove rule(s) from forever + until-quit\n"
-        "  reload               re-read the rules file from disk\n"
-        "  clear                drop all until-quit rules\n"
-        "  quit, exit           stop the boxwall (sandbox then has no network)\n"
-        "\nconnection prompts: [o]nce  [u]ntil-quit  [f]orever  [d]eny"
+        f"{C_HDR}commands{C_RESET} (type and press Enter):\n"
+        f"  {_key('help')}, {_key('h')}, {_key('?')}           show this help\n"
+        f"  {_key('rules')}, {_key('ls')}            list active allow + deny rules (forever + session)\n"
+        f"  {_key('history')}, {_key('log')}         hosts accessed this session (history clear to reset)\n"
+        f"  {_key('config')}               show settings + stats ({_key('config verbose on|off')})\n"
+        f"  {_key('allow')} <target>...    add allow-forever rule(s) (scopes below)\n"
+        f"  {_key('deny')}, {_key('block')} <target> add deny-forever rule(s) (auto-blocked, no prompt)\n"
+        f"  {_key('forget')} <target>...   remove rule(s) from allow + deny (forever + session)\n"
+        f"  {_key('reload')}               re-read the rules file from disk\n"
+        f"  {_key('clear')}                drop all session rules (until-quit + timed)\n"
+        f"  {_key('quit')}, {_key('exit')}           stop the boxwall (sandbox then has no network)\n"
+        f"\n{C_HDR}connection prompt{C_RESET} = {C_B}<action><duration>{C_RESET}[{C_ASK}scope{C_RESET}]:\n"
+        f"  {C_OK}allow{C_RESET}   {_key('ao')} once   {_key('aq')} until-quit   {_key('a1m')}/{_key('a1h')} timed   {_key('af')} forever\n"
+        f"  {C_NO}deny{C_RESET}    {_key('do')} once   {_key('dq')} until-quit   {_key('d1m')}/{_key('d1h')} timed   {_key('df')} forever\n"
+        f"  {C_ASK}scope{C_RESET}   append a letter (default = this exact host:port):\n"
+        f"            {_key('h')} this host, any port  (host:*)   "
+        f"{_key('p')} this port, any host  (*:port)\n"
+        f"            {_key('s')} this domain + subdomains (*.dom)   {_key('*')} anything (*)\n"
+        f"  plain {_key('⏎')} (or a bare {_key('d')}) = deny just this one connection.\n"
+        f"\n{C_HDR}rule targets{C_RESET} (for allow/deny/forget) use the same scope keys as stored:\n"
+        f"  {C_B}host:port{C_RESET}  exact   {C_DIM}·{C_RESET}   {C_B}host{C_RESET}  any port   {C_DIM}·{C_RESET}   {C_B}*:port{C_RESET}  any host on port\n"
+        f"  {C_B}*.domain{C_RESET}   domain + subdomains   {C_DIM}·{C_RESET}   {C_B}*{C_RESET}  any connection"
     )
 
 
+def _print_rule_set(title, forever_set, session_set, expiry):
+    now = time.time()
+    print(title)
+    if not forever_set and not session_set:
+        print("  (none)")
+        return
+    for h in sorted(forever_set):
+        print(f"  {h}  (forever)")
+    for h in sorted(session_set):
+        exp = expiry.get(h)
+        if exp is None:
+            suffix = "until quit"
+        else:
+            rem = int(exp - now)
+            suffix = f"{rem // 60}m{rem % 60:02d}s left" if rem > 0 else "expired"
+        print(f"  {h}  ({suffix})")
+
+
 def cmd_rules(args):
-    if forever_allow:
-        print("forever (persisted):")
-        for h in sorted(forever_allow):
-            print(f"  {h}")
-    else:
-        print("forever (persisted): (none)")
-    if session_allow:
-        print("until-quit (session):")
-        for h in sorted(session_allow):
-            print(f"  {h}")
-    else:
-        print("until-quit (session): (none)")
+    _print_rule_set("allow:", forever_allow, session_allow, session_expiry)
+    _print_rule_set("deny:", forever_deny, session_deny, deny_expiry)
 
 
 def cmd_history(args):
@@ -895,40 +1036,73 @@ def cmd_history(args):
     if not access_log:
         print("no connections seen this session yet")
         return
-    # Flag: F=allow-forever, U=until-quit, -=denied/once (not a standing rule).
+    # Flag reflects coverage by ANY rule (incl. wildcard/domain). Deny wins, so
+    # check it first: X=deny rule, F=allow-forever, U=allow-session, -=neither.
     print(f"     {'host':<34} {'hits':>5} {'deny':>5}  ports")
     for host, e in sorted(access_log.items(), key=lambda kv: kv[1]["count"], reverse=True):
-        flag = "F" if host in forever_allow else ("U" if host in session_allow else "-")
-        ports = ",".join(str(p) for p in sorted(e["ports"]))
-        print(f"[{flag}] {host:<34} {e['count']:>5} {e['denied']:>5}  {ports}")
+        ports = sorted(e["ports"])
+        if any(_covered_by(forever_deny, host, p) for p in ports) or \
+           any(_covered_by(session_deny, host, p, deny_expiry) for p in ports):
+            flag = "X"
+        elif any(_covered_by(forever_allow, host, p) for p in ports):
+            flag = "F"
+        elif any(_covered_by(session_allow, host, p, session_expiry) for p in ports):
+            flag = "U"
+        else:
+            flag = "-"
+        portstr = ",".join(str(p) for p in ports)
+        print(f"[{flag}] {host:<34} {e['count']:>5} {e['denied']:>5}  {portstr}")
 
 
 def cmd_config(args):
-    global verbose
+    global verbose, log_blocks
     if args and args[0] == "verbose" and len(args) >= 2:
         verbose = args[1].lower() in ("on", "true", "1", "yes")
         print(f"[boxwall] verbose {'on' if verbose else 'off'}")
         return
+    if args and args[0] == "blocks" and len(args) >= 2:
+        log_blocks = args[1].lower() in ("on", "true", "1", "yes")
+        print(f"[boxwall] blocks logging {'on' if log_blocks else 'off'}")
+        return
     if args:
         print("usage: config              show settings + stats")
-        print("       config verbose on|off")
+        print("       config verbose on|off   (log every allowed connection)")
+        print("       config blocks on|off    (log deny-rule auto-blocks)")
         return
     print(f"  port        {PORT}")
     print(f"  rules-file  {RULES_FILE}")
     print(f"  verbose     {'on' if verbose else 'off'}")
+    print(f"  blocks      {'on' if log_blocks else 'off'} (log deny-rule auto-blocks)")
     print(f"  default     deny (prompt on every new destination)")
-    print(f"  rules       {len(forever_allow)} forever, {len(session_allow)} until-quit")
+    print(f"  allow       {len(forever_allow)} forever, {len(session_allow)} session"
+          f" ({len(session_expiry)} timed)")
+    print(f"  deny        {len(forever_deny)} forever, {len(session_deny)} session"
+          f" ({len(deny_expiry)} timed)")
     print(f"  stats       seen={stats['seen']} "
           f"allowed={stats['allowed']} denied={stats['denied']}")
 
 
 def cmd_allow(args):
     if not args:
-        print("usage: allow <host>...")
+        print("usage: allow <target>...  (host:port | host | *:port | *.domain | *)")
         return
-    forever_allow.update(args)
+    for t in args:
+        forever_allow.add(t)
+        forever_deny.discard(t); session_deny.discard(t); deny_expiry.pop(t, None)
     save_rules()
     print(f"[boxwall] {C_OK}allow forever{C_RESET} {' '.join(args)}")
+
+
+def cmd_deny(args):
+    if not args:
+        print("usage: deny <target>...  (host:port | host | *:port | *.domain | *)")
+        return
+    for t in args:
+        forever_deny.add(t)
+        forever_allow.discard(t); session_allow.discard(t); session_expiry.pop(t, None)
+    _deny_logged.clear()
+    save_rules()
+    print(f"[boxwall] {C_NO}deny forever{C_RESET} {' '.join(args)}")
 
 
 def cmd_forget(args):
@@ -936,29 +1110,39 @@ def cmd_forget(args):
         print("usage: forget <host[:port]>...")
         return
     # `forget host` drops the bare-host rule and all its host:port rules;
-    # `forget host:port` drops just that one.
+    # `forget host:port` drops just that one. Clears both allow and deny.
     removed = []
     for h in args:
-        for store in (forever_allow, session_allow):
+        for store, expiry in ((forever_allow, session_expiry),
+                              (session_allow, session_expiry),
+                              (forever_deny, deny_expiry),
+                              (session_deny, deny_expiry)):
             for key in list(store):
                 base = key.rsplit(":", 1)[0] if ":" in key else key
                 if key == h or base == h:
                     store.discard(key)
+                    expiry.pop(key, None)
                     removed.append(key)
+    _deny_logged.clear()
     save_rules()
     print(f"[boxwall] forgot {' '.join(removed) if removed else '(nothing matched)'}")
 
 
 def cmd_reload(args):
     forever_allow.clear()
+    forever_deny.clear()
+    _deny_logged.clear()
     load_rules()
-    print(f"[boxwall] reloaded {len(forever_allow)} rule(s) from {RULES_FILE}")
+    print(f"[boxwall] reloaded {len(forever_allow)} allow + {len(forever_deny)} "
+          f"deny rule(s) from {RULES_FILE}")
 
 
 def cmd_clear(args):
-    n = len(session_allow)
-    session_allow.clear()
-    print(f"[boxwall] cleared {n} until-quit rule(s)")
+    n = len(session_allow) + len(session_deny)
+    session_allow.clear(); session_expiry.clear()
+    session_deny.clear(); deny_expiry.clear()
+    _deny_logged.clear()
+    print(f"[boxwall] cleared {n} session rule(s)")
 
 
 COMMANDS = {
@@ -967,7 +1151,8 @@ COMMANDS = {
     "history": cmd_history, "log": cmd_history,
     "config": cmd_config, "cfg": cmd_config,
     "allow": cmd_allow,
-    "forget": cmd_forget, "deny": cmd_forget,
+    "deny": cmd_deny, "block": cmd_deny,
+    "forget": cmd_forget, "unblock": cmd_forget,
     "reload": cmd_reload,
     "clear": cmd_clear,
 }
@@ -987,31 +1172,130 @@ def run_command(line):
     fn(cargs)
 
 
+_TIMED_RE = re.compile(r"(\d+)\s*([mh])")
+
+
+def parse_answer(raw):
+    # Answer grammar: <action><duration>[scope], read left-to-right (and order-
+    # tolerant). Returns (action, dur, scope) where:
+    #   action: "allow" (a, also the default) | "deny" (d)
+    #   dur:    "o" once | "q" until-quit | "f" forever | ("t", secs) timed | None
+    #   scope:  None (this host:port) | "h" | "p" | "s" | "a" (typed as *)
+    # Examples: ao=allow once · af=allow forever · do=deny once · df=deny forever
+    # · dfs=deny *.domain forever · af*=allow anything forever · a1m=allow 1 min.
+    # Empty Enter (or a bare d) = deny just this one connection.
+    # ('u' is accepted as an alias for 'q' until-quit.)
+    s = raw.strip().lower()
+    action, dur, scope = "allow", None, None
+    m = _TIMED_RE.search(s)
+    if m:
+        n = int(m.group(1))
+        dur = ("t", n * (3600 if m.group(2) == "h" else 60))
+        s = s[:m.start()] + s[m.end():]          # strip so its digits/suffix don't re-parse
+    for ch in s:
+        if ch == "d":
+            action = "deny"
+        elif ch == "a":
+            action = "allow"                     # a = allow action (no longer a scope)
+        elif dur is None and ch in "oqfu":
+            dur = "q" if ch in "qu" else ch      # q = until-quit (u is an alias)
+        elif ch in "hps*":
+            scope = "a" if ch == "*" else ch     # * = the "any connection" scope
+    return action, dur, scope
+
+
+def _fmt_duration(secs):
+    if secs < 3600:
+        return f"{secs // 60} min"
+    return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+
+
+def _commit(store_f, store_s, expiry_s, other_f, other_s, key, dur):
+    # Add `key` to the forever or session set for a given action, dropping the
+    # exact same key from the opposite action's sets so it lives in one place.
+    other_f.discard(key); other_s.discard(key)
+    if dur == "f":
+        store_f.add(key); save_rules()
+    elif dur == "q":
+        store_s.add(key); expiry_s.pop(key, None)
+    else:                                          # ("t", secs)
+        store_s.add(key); expiry_s[key] = time.time() + dur[1]
+
+
 def apply_answer(host, port, raw):
-    ans = raw.strip().lower()
-    key = f"{host}:{port}"
-    if ans == "f":
-        forever_allow.add(key); save_rules()
-        print(f"[boxwall] {C_OK}allow forever{C_RESET} {key}")
-        return True
-    if ans == "u":
-        session_allow.add(key)
-        print(f"[boxwall] {C_OK}allow until quit{C_RESET} {key}")
-        return True
-    if ans == "o":
-        print(f"[boxwall] {C_OK}allow once{C_RESET} {key}")
-        return True
-    print(f"[boxwall] {C_NO}deny{C_RESET} {key}")
-    return False
+    # Returns True (allow), False (deny), or None (incomplete -> reprompt, don't
+    # resolve the pending decision).
+    action, dur, scope = parse_answer(raw)
+    denying = action == "deny"
+
+    if dur is None:
+        # No duration named. An empty Enter or a bare 'd' = deny just this one
+        # connection (the default policy). Anything else named WHO (action/scope)
+        # but not HOW LONG -- guide to the full form, don't guess.
+        raws = raw.strip().lower()
+        if raws in ("", "d"):
+            print(f"[boxwall] {C_NO}deny{C_RESET} {host}:{port}")
+            return False
+        pre = "d" if denying else "a"
+        ex = ""
+        if scope is not None:
+            disp = "*" if scope == "a" else scope
+            ex = f"  (e.g. {C_B}{pre}f{disp}{C_RESET})"
+        print(f"[boxwall] add a duration — {C_B}{pre}o{C_RESET} once  "
+              f"{C_B}{pre}q{C_RESET} quit  {C_B}{pre}f{C_RESET} forever  "
+              f"{C_B}{pre}1m{C_RESET} timed{ex}.  just {C_B}⏎{C_RESET} = deny once.")
+        return None
+
+    if dur == "o":
+        # Once applies to just this single connection; no rule is stored.
+        verb = ("deny", C_NO) if denying else ("allow", C_OK)
+        print(f"[boxwall] {verb[1]}{verb[0]} once{C_RESET} {host}:{port}")
+        return not denying
+
+    key, label = scope_target(host, port, scope)
+    word = _fmt_duration(dur[1]) if isinstance(dur, tuple) else (
+        "forever" if dur == "f" else "until quit")
+    if denying:
+        _commit(forever_deny, session_deny, deny_expiry,
+                forever_allow, session_allow, key, dur)
+        print(f"[boxwall] {C_NO}deny {word}{C_RESET} {label}")
+        return False
+    _commit(forever_allow, session_allow, session_expiry,
+            forever_deny, session_deny, key, dur)
+    print(f"[boxwall] {C_OK}allow {word}{C_RESET} {label}")
+    return True
+
+
+def _key(k):
+    # A typeable key, bold so it stands out from the surrounding label text.
+    return f"{C_B}{k}{C_RESET}"
 
 
 def prompt_line(pending):
     if pending:
         host, port, ip, _ = pending[0]
-        where = f"{host}:{port}" if host == ip else f"{host}:{port} ({ip})"
+        where = f"{host}:{port}" if host == ip else f"{host}:{port} {C_DIM}({ip}){C_RESET}"
+        dom = parent_domain(host)
+        # Scope line offers how widely to apply the rule. Show the domain
+        # option only when there's a domain to generalize to (not for bare IPs).
+        # Label each scope by the rule it stores, with concrete values, so the
+        # letter lines up with what stays fixed: h -> host:* , p -> *:port.
+        scope = (f"  scope  {C_DIM}append{C_RESET} {_key('h')} {host}:* {C_DIM}(any port){C_RESET}  "
+                 f"{_key('p')} *:{port} {C_DIM}(any host){C_RESET}"
+                 + (f"  {_key('s')} *.{dom}" if dom else "")
+                 + f"  {_key('*')} {C_DIM}anything{C_RESET}")
         sys.stdout.write(
-            f"\n{C_ASK}[boxwall]{C_RESET} connection -> \033[1m{where}{C_RESET}\n"
-            f"  [o]nce  [u]ntil-quit  [f]orever  [d]eny (default): "
+            f"\n{C_ASK}[boxwall]{C_RESET} connection → {C_B}{where}{C_RESET}\n"
+            f"  allow  {_key('ao')} once  {_key('aq')} until quit"
+            f"  {_key('a1m')}/{_key('a1h')} timed  {_key('af')} forever\n"
+            f"  deny   {_key('do')} once  {_key('dq')} until quit"
+            f"  {_key('d1m')}/{_key('d1h')} timed  {_key('df')} forever"
+            f"   {_key('⏎')} {C_DIM}= do{C_RESET}\n"
+            f"{scope}\n"
+            f"  {C_DIM}e.g.{C_RESET}  {_key('af*')} allow anything forever  {C_DIM}·{C_RESET}  "
+            f"{_key('dfs')} deny domain forever  {C_DIM}·{C_RESET}  "
+            f"{_key('aqs')} allow domain till quit\n"
+            f"{C_ASK}>{C_RESET} "
         )
     else:
         sys.stdout.write(f"{C_HDR}boxwall>{C_RESET} ")
@@ -1030,7 +1314,7 @@ async def decision_printer(pending):
 async def console(reader, pending):
     # Sole owner of stdin; never cancels a readline. Each line answers the front
     # pending decision if one waits, else parses as a command.
-    cmd_help([])
+    print(f"{C_DIM}type {C_RESET}{C_B}help{C_RESET}{C_DIM} for commands and prompt keys.{C_RESET}")
     prompt_line(pending)
     while True:
         line = await reader.readline()
@@ -1039,9 +1323,15 @@ async def console(reader, pending):
             return
         text = line.decode("utf-8", "replace").strip()
         if pending:
-            host, port, ip, fut = pending.pop(0)
-            if not fut.cancelled():
-                fut.set_result(apply_answer(host, port, text))
+            host, port, ip, fut = pending[0]
+            decision = apply_answer(host, port, text)
+            if decision is None:
+                # Incomplete answer; keep this decision pending and reprompt.
+                pass
+            else:
+                pending.pop(0)
+                if not fut.cancelled():
+                    fut.set_result(decision)
         else:
             try:
                 run_command(text)
@@ -1081,7 +1371,8 @@ async def main():
         except Exception as e:
             print(f"[boxwall] WARN: DNS interceptor unavailable ({e}); DNS will be "
                   "blocked (egress stays fail-closed).", file=sys.stderr)
-    print(f"{C_HDR}[boxwall]{C_RESET} {len(forever_allow)} persisted allow rule(s) loaded.")
+    print(f"{C_HDR}[boxwall]{C_RESET} {len(forever_allow)} allow + {len(forever_deny)} "
+          f"deny rule(s) loaded.")
     reader = await connect_stdin()
     printer_task = asyncio.ensure_future(decision_printer(pending))
     console_task = asyncio.ensure_future(console(reader, pending))

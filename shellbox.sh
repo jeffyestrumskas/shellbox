@@ -36,7 +36,7 @@ USE_BOXWATCH=0                    # opt-in: record activity via the out-of-box b
 BOXWATCH_NAME="shellbox-boxwatch"     # boxwatch container to register with (see boxwatch.sh)
 WATCH_DIR="${HOME}/.shellbox/watch"   # where boxwatch reads target registrations
 ALLOW_HOST=0                      # opt-out: --allow-host disables the default host-egress block
-LOCKDOWN_TIMEOUT=150              # entrypoint gate: N * 0.1s before fail-closed refuse (default 15s)
+LOCKDOWN_TIMEOUT=200              # entrypoint gate: N * 0.1s before fail-closed refuse (20s; room for helper retries)
 
 EXTRA_MOUNTS=()
 PORTS=()
@@ -91,64 +91,46 @@ usage() {
   cat <<'EOF'
 Usage: ./shellbox.sh [options] [-- command...]
 
-Single-file dev sandbox. The Dockerfile is appended at the end of this script and extracted at build time.
-- Mounts the current directory to /home/dev/work and starts there.
-- Container is removed on exit (--rm) and auto-named by Docker (unless --container-name is provided).
-- Pip cache does NOT persist (PIP_NO_CACHE_DIR=1).
-- Images are tagged per profile (shellbox-dev:<profile>).
-- The container user is created with YOUR host UID/GID so file permissions just work.
+Single-file dev sandbox: mounts the current dir to /home/dev/work as your host
+UID/GID, runs Claude Code by default, and removes the container on exit.
 
 Options:
-  -n, --profile NAME                           Use a per-project image tag (shellbox-dev:NAME)
-  -v, --volume HOST_PATH:CONTAINER_PATH[:ro]   Add extra volume mount (repeatable)
-  -e, --env KEY=VALUE                          Add env var (repeatable)
-  -p, --port HOST_PORT:CONTAINER_PORT          Publish port (repeatable)
-  -N, --network NETWORK                        Connect to Docker network (repeatable)
-  --container-name NAME                        Set an explicit container name (otherwise Docker auto-names)
-  --image IMAGE                                Full image name override (e.g. myrepo:tag). Overrides --profile.
-  --rebuild                                     Force a full rebuild from scratch (docker build --no-cache)
-  --no-build                                   Don't build (assume image exists)
-  --runsc                                       Run under gVisor (--runtime=runsc) if registered; warn + continue if not
-  --boxwall NAME                                  Route all egress through the running boxwall.sh named NAME (interactive egress
-                                               firewall). NAME is required and must match the boxwall's --name.
-  --boxwall-name NAME                             Same as --boxwall NAME (explicit form; implies --boxwall)
-  --claw                                          "openclaw" mode: let an autonomous agent install software and run freely
-                                               INSIDE the box (default caps + seccomp, working sudo, PID guard) while it
-                                               still can't escape to the host. Only host effects: network + the bind mount.
-                                               Composes with --boxwall / --runsc for tighter egress / isolation.
-  --agent NAME                                    Which agent to install: claude (default), openclaw, or hermes.
-                                               claude (also used when --agent is omitted): installs Claude Code and uses
-                                               your host Claude config; no extra services, runs in any posture.
-                                               openclaw|hermes: installed from their source-of-truth installer, wired to
-                                               Ollama Cloud for models, config rendered in. Each REQUIRES both --claw and
-                                               --boxwall (autonomous in-box + cloud egress gated). Add a messaging channel
-                                               (e.g. a Telegram bot) in the rendered config; agent state (memory, config)
-                                               persists under ~/.shellbox/agents/NAME.
-  --agent-model NAME                              Override the Ollama Cloud model used by openclaw/hermes (default: qwen3-coder:480b-cloud).
-  --boxwatch [NAME]                               Record this box's file/network/process activity via a running boxwatch.sh
-                                               (out-of-box eBPF; the box can't see or disable it). Incompatible with --runsc.
-                                               Optional inline NAME picks the boxwatch container (default: shellbox-boxwatch).
-  --boxwatch-name NAME                            Same as --boxwatch NAME (explicit form; implies --boxwatch)
-  --allow-host                                    Disable the default host-egress block (let the box reach host-local
-                                               services such as host.docker.internal). The block is ON by default, so
-                                               a rogue agent can't reach services bound to your host. No effect with
-                                               --boxwall (which already gates all egress).
-  -h, --help                                   Show help
+  -n, --profile NAME        Per-project image tag (shellbox-dev:NAME)
+  -v, --volume SRC:DST[:ro] Extra volume mount (repeatable)
+  -e, --env KEY=VALUE       Extra env var (repeatable)
+  -p, --port HOST:CONTAINER Publish a port (repeatable)
+  -N, --network NAME        Connect to a Docker network (repeatable)
+  --container-name NAME     Explicit container name (default: Docker auto-names)
+  --image IMAGE             Full image override; takes precedence over --profile
+  --rebuild                 Force a clean rebuild (--no-cache)
+  --no-build                Skip build; assume the image exists
+  -h, --help                Show help
+
+Security / isolation:
+  --allow-host              Let the box reach host-local services. The host-egress
+                            block is ON by default (no effect under --boxwall).
+  --boxwall NAME            Route all egress through the running boxwall NAME
+                            (interactive firewall). --boxwall-name NAME is the same.
+  --runsc                   Run under gVisor if the runsc runtime is registered.
+  --boxwatch [NAME]         Record file/network/process activity via a running
+                            boxwatch (out-of-box eBPF). Conflicts with --runsc.
+                            --boxwatch-name NAME is the same.
+
+Agents:
+  --claw                    Let an autonomous agent install software and run freely
+                            INSIDE the box (still can't escape to the host).
+  --agent NAME              Agent to install: claude (default), openclaw, or hermes.
+                            openclaw/hermes need --claw and --boxwall; state persists
+                            under ~/.shellbox/agents/NAME.
+  --agent-model NAME        Ollama Cloud model for openclaw/hermes
+                            (default: qwen3-coder:480b-cloud).
 
 Examples:
-  ./shellbox.sh
-  ./shellbox.sh -n projectA
-  ./shellbox.sh -n projectA -v .:/pwd
-  ./shellbox.sh -p 8000:8000 -- python3 -m http.server 8000
-  ./shellbox.sh --container-name mybox   # fixed name (prevents running two with same name)
-  ./shellbox.sh -N sentirail             # join a Docker network (e.g. to reach boxwall-proxy)
-  ./shellbox.sh --claw                   # "openclaw": autonomous Claude that can install software, locked to the box
-  ./shellbox.sh --claw --boxwall proj-a  # same, but every outbound connection is gated by the egress firewall
-  ./shellbox.sh --boxwall proj-a         # attach to the boxwall named proj-a (its own rule set)
-  ./shellbox.sh --claw --boxwatch        # same, plus tamper-proof recording of all file/network/process activity
-  ./shellbox.sh --agent claude           # explicit: same as the bare default (installs Claude Code)
-  ./shellbox.sh --agent hermes --claw --boxwall proj-a   # build+configure Hermes (Ollama Cloud models), egress gated
-  ./shellbox.sh --agent openclaw --claw --boxwall proj-a # same, for OpenClaw
+  ./shellbox.sh                                      # Claude Code in the current dir
+  ./shellbox.sh -n projectA -p 8000:8000             # named profile, publish a port
+  ./shellbox.sh -- python3 -m http.server 8000       # run a one-off command
+  ./shellbox.sh --claw --boxwall proj-a              # autonomous agent, egress gated
+  ./shellbox.sh --agent hermes --claw --boxwall proj-a
 EOF
 }
 
@@ -638,16 +620,16 @@ if [[ "${USE_BOXWATCH}" -eq 1 ]]; then
   esac
 fi
 
-# Host-egress block: stage a host-owned "gate" dir, mounted read-only into the box.
-# The entrypoint blocks until a background helper (below) confirms the DROP rules are
-# in place by writing <gate>/ready; if it never appears, the entrypoint refuses to
-# start (fail-closed). The box can't forge the sentinel: it's mounted ro AND nothing
-# in the box is running yet while the entrypoint waits.
+# Host-egress block: the entrypoint blocks until a background helper (below) confirms
+# the DROP rules are in place, then fails closed if they never land. The gate dir lives
+# INSIDE the box at /run/shellbox-gate and is populated by the helper via `docker exec`
+# as root — NOT a host bind mount. (A host `mktemp -d` bind mount is unreliable on
+# Docker Desktop: if the temp path isn't in File Sharing the mount appears EMPTY in the
+# box, so the host-written sentinel/log are never visible and the gate always times out.)
+# The box runs as a non-root user with cap-drop ALL and can't write to /run, so it still
+# can't forge the `ready` sentinel.
 if [[ "${LOCKDOWN}" -eq 1 ]]; then
-  LOCKDOWN_GATE_DIR="$(mktemp -d)"
-  chmod 700 "${LOCKDOWN_GATE_DIR}"
   DOCKER_ARGS+=(
-    -v "${LOCKDOWN_GATE_DIR}:/run/shellbox-gate:ro"
     -e "SHELLBOX_LOCKDOWN_GATE=/run/shellbox-gate/ready"
     -e "SHELLBOX_LOCKDOWN_TIMEOUT=${LOCKDOWN_TIMEOUT}"
   )
@@ -804,6 +786,10 @@ if [[ "${LOCKDOWN}" -eq 1 ]]; then
   #      carve-out so the blanket can never blackhole the box's own DNS.
   #   3. Drop link-local (incl. cloud metadata 169.254.169.254).
   # Pure bash + getent/grep/cut (no iproute2); harmless on hosts without that range.
+  # Every iptables call uses `-w 5` (wait up to 5s for the xtables lock) so it can't
+  # fail just because the daemon is mid-flight on its own netfilter changes. Each step
+  # echoes what it's doing: the helper captures this into <gate>/log, which the box
+  # surfaces (read-only) if the gate ever times out — so a failure is never silent.
   LOCKDOWN_SCRIPT='set -eu
 gwip=""
 while read -r _if dest gw _rest; do
@@ -811,34 +797,71 @@ while read -r _if dest gw _rest; do
   gwip=$(printf "%d.%d.%d.%d" "0x${gw:6:2}" "0x${gw:4:2}" "0x${gw:2:2}" "0x${gw:0:2}")
   break
 done < /proc/net/route
+echo "default gateway: ${gwip:-<none>}"
 for name in host.docker.internal gateway.docker.internal; do
   hip=$(getent hosts "$name" 2>/dev/null | head -n1 | cut -d" " -f1 || true)
-  [ -z "$hip" ] && continue
-  [ "$hip" = "$gwip" ] && continue
-  iptables -A OUTPUT -d "$hip" -j DROP
+  [ -z "$hip" ] && { echo "skip $name (unresolved)"; continue; }
+  [ "$hip" = "$gwip" ] && { echo "skip $name=$hip (is default gateway)"; continue; }
+  echo "drop $name=$hip"
+  iptables -w 5 -A OUTPUT -d "$hip" -j DROP
 done
 dns=$(grep -m1 "^nameserver" /etc/resolv.conf 2>/dev/null | cut -d" " -f2 || true)
 case "$dns" in
   192.168.65.*)
-    iptables -I OUTPUT 1 -d "$dns" -j ACCEPT
-    iptables -A OUTPUT -d 192.168.65.0/24 -j DROP
+    echo "accept dns $dns; drop rest of 192.168.65.0/24"
+    iptables -w 5 -I OUTPUT 1 -d "$dns" -j ACCEPT
+    iptables -w 5 -A OUTPUT -d 192.168.65.0/24 -j DROP
     ;;
+  *) echo "dns ${dns:-<none>} outside docker-desktop host range; leaving 192.168.65.0/24 alone" ;;
 esac
-iptables -A OUTPUT -d 169.254.0.0/16 -j DROP'
+iptables -w 5 -A OUTPUT -d 169.254.0.0/16 -j DROP
+echo "host-egress DROP rules installed"'
   (
-    for _ in $(seq 1 100); do
-      if [[ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER_NAME}" 2>/dev/null || true)" == "true" ]]; then
+    # Stage the helper log on the HOST, then push it into the box's own filesystem with
+    # `docker exec` (no bind mount involved). The box reads /run/shellbox-gate/log and
+    # prints it if the gate times out; the WAIT phase is logged too, so "container never
+    # went running" is distinguishable from "sidecar failed".
+    _log="$(mktemp)"
+    echo "helper: waiting for container '${CONTAINER_NAME}' to report running" > "${_log}"
+    _state=""
+    for _ in $(seq 1 200); do
+      _state="$(docker inspect -f '{{.State.Status}}' "${CONTAINER_NAME}" 2>>"${_log}" || true)"
+      [[ "${_state}" == "running" ]] && break
+      sleep 0.1
+    done
+    echo "after wait: container state='${_state:-<empty>}'" >> "${_log}"
+    if [[ "${_state}" != "running" ]]; then
+      echo "FAILED: container '${CONTAINER_NAME}' never reached 'running'. The sidecar was not run." >> "${_log}"
+    fi
+
+    # Apply the DROP rules in the box's netns, retrying a few times so a transient
+    # daemon/iptables hiccup doesn't strand us fail-closed.
+    _ok=0
+    if [[ "${_state}" == "running" ]]; then
+      for _attempt in 1 2 3; do
+        echo "=== host-egress block: attempt ${_attempt} ===" >> "${_log}"
         if docker run --rm \
              --cap-add NET_ADMIN --cap-add NET_RAW --user 0:0 \
              --network "container:${CONTAINER_NAME}" \
              --entrypoint /bin/bash \
-             "${IMAGE_NAME}" -c "${LOCKDOWN_SCRIPT}" >/dev/null 2>&1; then
-          : > "${LOCKDOWN_GATE_DIR}/ready"
+             "${IMAGE_NAME}" -c "${LOCKDOWN_SCRIPT}" >> "${_log}" 2>&1; then
+          _ok=1; break
         fi
-        break
-      fi
-      sleep 0.1
-    done
+        sleep 0.5
+      done
+    fi
+
+    # Publish the log into the box (best-effort) and, only on a clean apply, the `ready`
+    # sentinel. Both go through `docker exec` as root: /run is root-owned, so the box's
+    # own non-root user (cap-drop ALL) can neither read a stale gate nor forge `ready`.
+    docker exec -i --user 0:0 "${CONTAINER_NAME}" \
+      /bin/sh -c 'mkdir -p /run/shellbox-gate && cat > /run/shellbox-gate/log && chmod 644 /run/shellbox-gate/log' \
+      < "${_log}" >/dev/null 2>&1 || true
+    if [[ "${_ok}" -eq 1 ]]; then
+      docker exec --user 0:0 "${CONTAINER_NAME}" \
+        /bin/sh -c ': > /run/shellbox-gate/ready' >/dev/null 2>&1 || true
+    fi
+    rm -f "${_log}"
   ) &
 
   printf '\033[1;36m[shellbox:lock]\033[0m host-egress block ON — the box cannot reach host-local services (host.docker.internal et al.).\n' >&2
@@ -1007,6 +1030,14 @@ RUN printf '%s\n' \
   '    _tries=$((_tries+1))' \
   '    if [ "${_tries}" -gt "${_max}" ]; then' \
   '      printf "\033[1;31m[shellbox]\033[0m FATAL: host-egress block was not applied in time; refusing to start (fail-closed).\n" >&2' \
+  '      _gatelog="$(dirname "${SHELLBOX_LOCKDOWN_GATE}")/log"' \
+  '      if [ -s "${_gatelog}" ]; then' \
+  '        printf "  --- host-egress helper log ---\n" >&2' \
+  '        sed "s/^/  /" "${_gatelog}" >&2' \
+  '        printf "  -------------------------------\n" >&2' \
+  '      else' \
+  '        printf "  (no helper log was produced — the netns sidecar never ran; check that the Docker daemon is reachable.)\n" >&2' \
+  '      fi' \
   '      printf "  Rebuild the image (--rebuild) or, to allow host access on purpose, rerun with --allow-host.\n" >&2' \
   '      exit 1' \
   '    fi' \
