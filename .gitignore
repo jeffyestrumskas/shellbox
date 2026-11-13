@@ -3,6 +3,7 @@
 
 !/.gitignore
 !/README.md
+!/LICENSE
 !/shellbox.sh
 
 # boxwall/ — keep only the script + its README (drops boxwall-diag.sh etc.)
