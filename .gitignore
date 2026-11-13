@@ -1,0 +1,32 @@
+# Default-deny
+/*
+
+!/.gitignore
+!/README.md
+!/shellbox.sh
+
+# boxwall/ — keep only the script + its README (drops boxwall-diag.sh etc.)
+!/boxwall/
+/boxwall/*
+!/boxwall/README.md
+!/boxwall/boxwall.sh
+
+# boxwatch/ — keep only the script + its README
+!/boxwatch/
+/boxwatch/*
+!/boxwatch/README.md
+!/boxwatch/boxwatch.sh
+
+# agents/ — per-agent files for shellbox.sh --agent (keep README + pi extensions)
+!/agents/
+/agents/*
+!/agents/README.md
+!/agents/pi/
+/agents/pi/*
+!/agents/pi/extensions/
+/agents/pi/extensions/*
+!/agents/pi/extensions/*.ts
+
+**/.env
+**/.env.*
+**/*.env
